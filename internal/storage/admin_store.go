@@ -56,6 +56,22 @@ func (s *AdminStore) IsSupport(ctx context.Context, userID uuid.UUID) (bool, err
 	return isAdmin || isSupport, nil
 }
 
+// IsMarketing returns whether the given user has marketing access.
+// Admins always count as marketing — same pattern as IsSupport.
+func (s *AdminStore) IsMarketing(ctx context.Context, userID uuid.UUID) (bool, error) {
+	var isAdmin, isMarketing bool
+	err := s.DB.Pool.QueryRow(ctx,
+		`SELECT is_admin, is_marketing FROM users WHERE user_id = $1`, userID,
+	).Scan(&isAdmin, &isMarketing)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("is_marketing lookup: %w", err)
+	}
+	return isAdmin || isMarketing, nil
+}
+
 // SetAdminByAddress flips the is_admin flag for a user looked up by
 // address. Used by the bootstrap-admin sync at backend startup so the
 // first admin can be seeded from an env var without manual SQL.
@@ -87,25 +103,34 @@ func (s *AdminStore) SetAdmin(ctx context.Context, userID uuid.UUID, isAdmin boo
 	return nil
 }
 
-// SetRoles atomically sets both is_admin and is_support for a user.
-// Returns the previous values so the caller can include them in the
-// audit log.
-func (s *AdminStore) SetRoles(ctx context.Context, userID uuid.UUID, isAdmin, isSupport bool) (beforeAdmin, beforeSupport bool, err error) {
+// UserRoles is the before/after snapshot of role flags returned from
+// SetRoles for audit logging.
+type UserRoles struct {
+	IsAdmin     bool `json:"is_admin"`
+	IsSupport   bool `json:"is_support"`
+	IsMarketing bool `json:"is_marketing"`
+}
+
+// SetRoles atomically sets is_admin, is_support, and is_marketing for a
+// user. Returns the previous flags so the caller can include them in
+// the audit log.
+func (s *AdminStore) SetRoles(ctx context.Context, userID uuid.UUID, target UserRoles) (UserRoles, error) {
+	var before UserRoles
 	if scanErr := s.DB.Pool.QueryRow(ctx,
-		`SELECT is_admin, is_support FROM users WHERE user_id = $1`, userID,
-	).Scan(&beforeAdmin, &beforeSupport); scanErr != nil {
+		`SELECT is_admin, is_support, is_marketing FROM users WHERE user_id = $1`, userID,
+	).Scan(&before.IsAdmin, &before.IsSupport, &before.IsMarketing); scanErr != nil {
 		if errors.Is(scanErr, pgx.ErrNoRows) {
-			return false, false, fmt.Errorf("user not found: %s", userID)
+			return UserRoles{}, fmt.Errorf("user not found: %s", userID)
 		}
-		return false, false, fmt.Errorf("read pre-state: %w", scanErr)
+		return UserRoles{}, fmt.Errorf("read pre-state: %w", scanErr)
 	}
 	if _, execErr := s.DB.Pool.Exec(ctx,
-		`UPDATE users SET is_admin = $2, is_support = $3 WHERE user_id = $1`,
-		userID, isAdmin, isSupport,
+		`UPDATE users SET is_admin = $2, is_support = $3, is_marketing = $4 WHERE user_id = $1`,
+		userID, target.IsAdmin, target.IsSupport, target.IsMarketing,
 	); execErr != nil {
-		return false, false, fmt.Errorf("set_roles: %w", execErr)
+		return UserRoles{}, fmt.Errorf("set_roles: %w", execErr)
 	}
-	return beforeAdmin, beforeSupport, nil
+	return before, nil
 }
 
 // RoleMessage is one row of the role-message inbox. See migration 097

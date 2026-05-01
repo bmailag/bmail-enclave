@@ -326,6 +326,14 @@ func run() error {
 	mux.HandleFunc("/app/api/", apiHandler)    // primary (new)
 	mux.HandleFunc("/fakeid/api/", apiHandler) // fake id (new)
 
+	// /r/<code> short-link redirector. Public (no auth), proxied to the
+	// backend without path rewriting — gatewayBackendPath leaves /r/*
+	// untouched. Backend looks up the code in short_codes and 302s to
+	// <target_path>?_a=<affiliate_code>.
+	mux.HandleFunc("/r/", func(w http.ResponseWriter, r *http.Request) {
+		apiProxy.ServeHTTP(w, r)
+	})
+
 	// Image proxy for authenticated users.
 	// Three mount points so the URL path matches the session-cookie scope
 	// the browser will use:
