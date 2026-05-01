@@ -25,10 +25,12 @@ SIGNING_KEY := private.pem
 
 all: $(ENCLAVES) $(SUPER_ENCLAVES)
 
-# Super variants depend on their non-super counterparts so the Go
-# binary is built once and reused.
-gateway-super: gateway
-smtp-inbound-super: smtp-inbound
+# Super variants do their own ego-go build rather than reusing the
+# regular target's binary — `ego sign` modifies the binary in place,
+# so a copy of the post-signed regular binary would get double-signed
+# and produce a different MRENCLAVE than a clean rebuild. The source
+# is byte-deterministic, so a second ego-go build adds ~15 seconds
+# but produces the same content as the first.
 
 # Each enclave: build the Go binary with deterministic flags, sign it
 # with the throwaway key, extract MRENCLAVE, compare to the checked-in
@@ -55,15 +57,22 @@ $(ENCLAVES):
 	    exit 1 ; \
 	  fi
 
-# Super variant build: copy the regular binary, swap in the .super
-# JSON, re-sign, assert MRENCLAVE matches the .super.mrenclave file.
+# Super variant build: matches the production CI pattern in
+# .gitlab-ci.yml's build:enclave:gateway:super job. Builds in a
+# private subdirectory ($BUILD_DIR/super-<base>/) so the .super.json's
+# "exe": "<base>" field finds its binary unmodified, then copies the
+# signed result up to $BUILD_DIR/<base>-super for the workflow's
+# release-asset upload to find. Independent ego-go build (not a copy
+# of the regular target's already-signed binary).
 $(SUPER_ENCLAVES):
 	@echo ">>> $@ (SGX2 super variant)"
 	@base=$$(echo $@ | sed 's/-super$$//') ; \
-	  cp $(BUILD_DIR)/$$base $(BUILD_DIR)/$@ ; \
-	  cp enclave/$$base.super.json $(BUILD_DIR)/$@.json
-	cp $(SIGNING_KEY) $(BUILD_DIR)/private.pem
-	cd $(BUILD_DIR) && ego sign $@.json
+	  mkdir -p $(BUILD_DIR)/super-$$base ; \
+	  CGO_ENABLED=1 ego-go build -tags ego -trimpath -buildvcs=false -ldflags="-s -w -buildid=" -o $(BUILD_DIR)/super-$$base/$$base ./cmd/$$base ; \
+	  cp enclave/$$base.super.json $(BUILD_DIR)/super-$$base/$$base.json ; \
+	  cp $(SIGNING_KEY) $(BUILD_DIR)/super-$$base/private.pem ; \
+	  (cd $(BUILD_DIR)/super-$$base && ego sign $$base.json) ; \
+	  cp $(BUILD_DIR)/super-$$base/$$base $(BUILD_DIR)/$@
 	@MRE=$$(ego uniqueid $(BUILD_DIR)/$@) ; \
 	  base=$$(echo $@ | sed 's/-super$$//') ; \
 	  EXPECTED=$$(tr -d '[:space:]' < enclave/mrenclaves/$$base.super.mrenclave) ; \
