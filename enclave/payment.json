@@ -1,0 +1,34 @@
+{
+    "exe": "payment",
+    "key": "private.pem",
+    "debug": false,
+    "heapSize": 128,
+    "productID": 3,
+    "securityVersion": 1,
+    "mounts": [
+        {"source": "/opt/bmail/sealed", "target": "/opt/bmail/sealed", "type": "hostfs", "readOnly": false},
+        {"source": "/etc/ssl/certs", "target": "/etc/ssl/certs", "type": "hostfs", "readOnly": true}
+    ],
+    "env": [
+        {"name": "VP_ENV", "fromHost": true},
+        {"name": "DATABASE_URL", "fromHost": true},
+        {"name": "DATABASE_READ_URL", "fromHost": true},
+        {"name": "DB_MAX_CONNS", "fromHost": true},
+        {"name": "DB_MIN_CONNS", "fromHost": true},
+        {"name": "PAYMENT_ADDR", "fromHost": true},
+        {"name": "PAYMENT_PLAINHTTP", "fromHost": true},
+        {"name": "PAYMENT_API_KEY", "fromHost": true},
+        {"name": "NATS_URL", "fromHost": true},
+        {"name": "STRIPE_SECRET_KEY", "fromHost": true},
+        {"name": "LND_REST_URL", "fromHost": true},
+        {"name": "LND_MACAROON", "fromHost": true},
+        {"name": "ENABLE_EXPERIMENTAL_CRYPTO", "fromHost": true},
+        {"name": "BITCOIN_RPC_URL", "fromHost": true},
+        {"name": "BITCOIN_RPC_USER", "fromHost": true},
+        {"name": "BITCOIN_RPC_PASSWORD", "fromHost": true},
+        {"name": "MONERO_WALLET_RPC_URL", "fromHost": true},
+        {"name": "ETHEREUM_RPC_URL", "fromHost": true},
+        {"name": "ETHEREUM_CONTRACT_ADDRESS", "fromHost": true},
+        {"name": "BATCH_SIGNING_INTERVAL", "fromHost": true}
+    ]
+}

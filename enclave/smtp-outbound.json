@@ -1,0 +1,37 @@
+{
+    "exe": "smtp-outbound",
+    "key": "private.pem",
+    "debug": false,
+    "heapSize": 512,
+    "productID": 3,
+    "securityVersion": 1,
+    "mounts": [
+        {"source": "/opt/bmail/sealed", "target": "/opt/bmail/sealed", "type": "hostfs", "readOnly": false},
+        {"source": "/etc/ssl/certs", "target": "/etc/ssl/certs", "type": "hostfs", "readOnly": true},
+        {"source": "/etc/resolv.conf", "target": "/etc/resolv.conf", "type": "hostfs", "readOnly": true}
+    ],
+    "env": [
+        {"name": "VP_ENV", "fromHost": true},
+        {"name": "DATABASE_URL", "fromHost": true},
+        {"name": "DATABASE_READ_URL", "fromHost": true},
+        {"name": "DB_MAX_CONNS", "fromHost": true},
+        {"name": "DB_MIN_CONNS", "fromHost": true},
+        {"name": "NATS_URL", "fromHost": true},
+        {"name": "NATS_HMAC_KEY", "fromHost": true},
+        {"name": "REDIS_URL", "fromHost": true},
+        {"name": "MINIO_ENDPOINT", "fromHost": true},
+        {"name": "MINIO_ACCESS_KEY", "fromHost": true},
+        {"name": "MINIO_SECRET_KEY", "fromHost": true},
+        {"name": "MINIO_USE_SSL", "fromHost": true},
+        {"name": "HEALTH_PORT", "fromHost": true},
+        {"name": "DKIM_API_KEY", "fromHost": true},
+        {"name": "DEFAULT_DOMAIN", "fromHost": true},
+        {"name": "SMTP_HOSTNAME", "fromHost": true},
+        {"name": "DANE_UPDATE_URL", "fromHost": true},
+        {"name": "PEER_PORT", "fromHost": true},
+        {"name": "KEYSTORE_ADDR", "fromHost": true},
+        {"name": "KEYSTORE_MRENCLAVE_HEX", "fromHost": true},
+        {"name": "KEYSTORE_DKIM_POOL_SELECTORS", "fromHost": true},
+        {"name": "KEYSTORE_DKIM_POOL_ZONE", "fromHost": true}
+    ]
+}

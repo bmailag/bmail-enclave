@@ -1,0 +1,42 @@
+{
+    "exe": "smtp-inbound",
+    "key": "private.pem",
+    "debug": false,
+    "_comment": "super-server (SGX2 Xeon Gold, ~64 GB EPC) variant. Same code/mounts/env as smtp-inbound.json — only heapSize differs. Built as smtp-inbound-super-bundle and shipped ONLY to super-server (deploy:production); fullxp + any other SGX1 host gets the small smtp-inbound.json bundle.",
+    "heapSize": 32768,
+    "productID": 1,
+    "securityVersion": 1,
+    "mounts": [
+        {"source": "/opt/bmail/sealed", "target": "/opt/bmail/sealed", "type": "hostfs", "readOnly": false},
+        {"source": "/opt/bmail/certs", "target": "/opt/bmail/certs", "type": "hostfs", "readOnly": true},
+        {"source": "/etc/ssl/certs", "target": "/etc/ssl/certs", "type": "hostfs", "readOnly": true},
+        {"source": "/etc/resolv.conf", "target": "/etc/resolv.conf", "type": "hostfs", "readOnly": true}
+    ],
+    "env": [
+        {"name": "VP_ENV", "fromHost": true},
+        {"name": "DATABASE_URL", "fromHost": true},
+        {"name": "DATABASE_READ_URL", "fromHost": true},
+        {"name": "DB_MAX_CONNS", "fromHost": true},
+        {"name": "DB_MIN_CONNS", "fromHost": true},
+        {"name": "NATS_URL", "fromHost": true},
+        {"name": "NATS_HMAC_KEY", "fromHost": true},
+        {"name": "MINIO_ENDPOINT", "fromHost": true},
+        {"name": "MINIO_ACCESS_KEY", "fromHost": true},
+        {"name": "MINIO_SECRET_KEY", "fromHost": true},
+        {"name": "REDIS_ADDR", "fromHost": true},
+        {"name": "SMTP_HOSTNAME", "fromHost": true},
+        {"name": "SMTP_ADDR", "fromHost": true},
+        {"name": "HEALTH_PORT", "fromHost": true},
+        {"name": "SMTP_MIN_TLS_VERSION", "fromHost": true},
+        {"name": "SMTP_SIGNING_KEY", "fromHost": true},
+        {"name": "BLIND_INDEX_SECRET", "fromHost": true},
+        {"name": "SEALED_SIGNING_KEY_PATH", "fromHost": true},
+        {"name": "OTEL_EXPORTER_OTLP_ENDPOINT", "fromHost": true},
+        {"name": "LETSENCRYPT_CERT_PATH", "fromHost": true},
+        {"name": "GENERATE_CSR", "fromHost": true},
+        {"name": "GENERATE_KEY", "fromHost": true},
+        {"name": "OUTPUT_SEAL_PATH", "fromHost": true},
+        {"name": "DANE_UPDATE_URL", "fromHost": true},
+        {"name": "PEER_PORT", "fromHost": true}
+    ]
+}

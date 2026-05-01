@@ -1,0 +1,33 @@
+{
+    "exe": "gateway",
+    "key": "private.pem",
+    "debug": false,
+    "heapSize": 256,
+    "productID": 2,
+    "securityVersion": 2,
+    "mounts": [
+        {"source": "/opt/bmail/certs", "target": "/opt/bmail/certs", "type": "hostfs", "readOnly": false},
+        {"source": "/etc/ssl/certs", "target": "/etc/ssl/certs", "type": "hostfs", "readOnly": true},
+        {"source": "/var/www/bmail", "target": "/var/www/bmail", "type": "hostfs", "readOnly": true},
+        {"source": "/var/www/acme-challenges", "target": "/var/www/acme-challenges", "type": "hostfs", "readOnly": true},
+        {"source": "/etc/resolv.conf", "target": "/etc/resolv.conf", "type": "hostfs", "readOnly": true}
+    ],
+    "env": [
+        {"name": "BACKEND_URL", "fromHost": true},
+        {"name": "WEB_ROOT", "fromHost": true},
+        {"name": "GATEWAY_DOMAINS", "fromHost": true},
+        {"name": "GATEWAY_ADDR", "fromHost": true},
+        {"name": "GATEWAY_PLAINHTTP", "fromHost": true},
+        {"name": "CERT_CACHE_DIR", "fromHost": true},
+        {"name": "RATE_LIMIT", "fromHost": true},
+        {"name": "KT_URL", "fromHost": true},
+        {"name": "NOINDEX", "fromHost": true},
+        {"name": "ATTESTATION_URL_SMTP_INBOUND", "fromHost": true},
+        {"name": "ATTESTATION_URL_SMTP_OUTBOUND", "fromHost": true},
+        {"name": "ATTESTATION_URL_PAYMENT", "fromHost": true},
+        {"name": "ATTESTATION_URL_KEYSTORE", "fromHost": true},
+        {"name": "ACME_DIRECTORY_URL", "fromHost": true},
+        {"name": "ACME_EAB_KID", "fromHost": true},
+        {"name": "ACME_EAB_HMAC_KEY_B64", "fromHost": true}
+    ]
+}

@@ -1,0 +1,99 @@
+name: build
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+    branches: [master]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed for tag-push releases
+
+jobs:
+  reproducibility-check:
+    runs-on: ubuntu-latest
+    container:
+      # Must match the EGo version used by the GitLab CI job that builds
+      # the enclave binaries running at bmail.ag. Bump in lockstep.
+      image: ghcr.io/edgelesssys/ego-dev:v1.8.1
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+
+      - name: Build all five enclaves and assert MRENCLAVE
+        run: make all
+
+      - name: Re-collect MRENCLAVE values for release notes
+        id: mre
+        run: |
+          for svc in gateway smtp-inbound smtp-outbound payment keystore; do
+            mre=$(ego uniqueid build/${svc})
+            echo "${svc}_mrenclave=${mre}" >> "$GITHUB_OUTPUT"
+            echo "${svc}: ${mre}"
+          done
+
+      - name: Upload signed enclave artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: enclaves
+          path: |
+            build/gateway
+            build/smtp-inbound
+            build/smtp-outbound
+            build/payment
+            build/keystore
+            enclave/mrenclaves/
+          if-no-files-found: error
+
+      - name: Attach to existing release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2.6.2
+        with:
+          files: |
+            build/gateway
+            build/smtp-inbound
+            build/smtp-outbound
+            build/payment
+            build/keystore
+
+      - name: Create release for tag push
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2.6.2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: |
+            Automated release built by GitHub Actions from tag `${{ github.ref_name }}`.
+
+            **Expected MRENCLAVE values** (verify with `curl https://bmail.ag/.well-known/sgx-quotes/<name>`):
+
+            ```
+            gateway       ${{ steps.mre.outputs.gateway_mrenclave }}
+            smtp-inbound  ${{ steps.mre.outputs.smtp-inbound_mrenclave }}
+            smtp-outbound ${{ steps.mre.outputs.smtp-outbound_mrenclave }}
+            payment       ${{ steps.mre.outputs.payment_mrenclave }}
+            keystore      ${{ steps.mre.outputs.keystore_mrenclave }}
+            ```
+
+            These are the byte sequences EGo signs into the enclave
+            measurements bmail.ag's services attest to clients.
+
+            To verify locally:
+
+            ```
+            git clone https://github.com/bmailag/bmail-enclave.git
+            cd bmail-enclave
+            docker run --rm -v "$PWD":/src -w /src ghcr.io/edgelesssys/ego-dev:v1.8.1 make all
+            ```
+
+            Built with EGo v1.8.1 (linux/amd64).
+          files: |
+            build/gateway
+            build/smtp-inbound
+            build/smtp-outbound
+            build/payment
+            build/keystore
