@@ -5,6 +5,13 @@
 
 EGO_VERSION  := 1.8.1
 ENCLAVES     := gateway smtp-inbound smtp-outbound payment keystore
+# SGX2 "super" variants reuse the same Go binary but ship a different
+# EGo JSON config (larger heap sized for the 64 GB EPC on the prod
+# super-server). The MRENCLAVE differs because heapSize is hashed
+# into the measurement. gateway and smtp-inbound are the only enclaves
+# whose super variants run in production; the others use the regular
+# small-heap config on every host.
+SUPER_ENCLAVES := gateway-super smtp-inbound-super
 BUILD_DIR    := build
 GOFLAGS      := -tags ego -trimpath -buildvcs=false -ldflags=-s -w -buildid=
 
@@ -14,9 +21,14 @@ GOFLAGS      := -tags ego -trimpath -buildvcs=false -ldflags=-s -w -buildid=
 # real production key lives off-line at VP.net and is never published.
 SIGNING_KEY := private.pem
 
-.PHONY: all clean check $(ENCLAVES)
+.PHONY: all clean check $(ENCLAVES) $(SUPER_ENCLAVES)
 
-all: $(ENCLAVES)
+all: $(ENCLAVES) $(SUPER_ENCLAVES)
+
+# Super variants depend on their non-super counterparts so the Go
+# binary is built once and reused.
+gateway-super: gateway
+smtp-inbound-super: smtp-inbound
 
 # Each enclave: build the Go binary with deterministic flags, sign it
 # with the throwaway key, extract MRENCLAVE, compare to the checked-in
@@ -34,6 +46,27 @@ $(ENCLAVES):
 	cd $(BUILD_DIR) && ego sign $@.json
 	@MRE=$$(ego uniqueid $(BUILD_DIR)/$@) ; \
 	  EXPECTED=$$(tr -d '[:space:]' < enclave/mrenclaves/$@.mrenclave) ; \
+	  if [ "$$MRE" = "$$EXPECTED" ]; then \
+	    echo "    $@: MRENCLAVE OK ($$MRE)" ; \
+	  else \
+	    echo "    $@: MRENCLAVE MISMATCH" ; \
+	    echo "      expected: $$EXPECTED" ; \
+	    echo "      built:    $$MRE" ; \
+	    exit 1 ; \
+	  fi
+
+# Super variant build: copy the regular binary, swap in the .super
+# JSON, re-sign, assert MRENCLAVE matches the .super.mrenclave file.
+$(SUPER_ENCLAVES):
+	@echo ">>> $@ (SGX2 super variant)"
+	@base=$$(echo $@ | sed 's/-super$$//') ; \
+	  cp $(BUILD_DIR)/$$base $(BUILD_DIR)/$@ ; \
+	  cp enclave/$$base.super.json $(BUILD_DIR)/$@.json
+	cp $(SIGNING_KEY) $(BUILD_DIR)/private.pem
+	cd $(BUILD_DIR) && ego sign $@.json
+	@MRE=$$(ego uniqueid $(BUILD_DIR)/$@) ; \
+	  base=$$(echo $@ | sed 's/-super$$//') ; \
+	  EXPECTED=$$(tr -d '[:space:]' < enclave/mrenclaves/$$base.super.mrenclave) ; \
 	  if [ "$$MRE" = "$$EXPECTED" ]; then \
 	    echo "    $@: MRENCLAVE OK ($$MRE)" ; \
 	  else \

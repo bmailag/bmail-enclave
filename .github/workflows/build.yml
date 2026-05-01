@@ -30,9 +30,20 @@ jobs:
       - name: Re-collect MRENCLAVE values for release notes
         id: mre
         run: |
+          # Regular variants (run on SGX1 hosts: fullxp, Box 1, Box 4)
           for svc in gateway smtp-inbound smtp-outbound payment keystore; do
             mre=$(ego uniqueid build/${svc})
             echo "${svc}_mrenclave=${mre}" >> "$GITHUB_OUTPUT"
+            echo "${svc}: ${mre}"
+          done
+          # Super variants (gateway + smtp-inbound run on the SGX2
+          # super-server in production; same source, larger heap).
+          # Output keys use underscores because GITHUB_OUTPUT values
+          # follow shell-variable naming.
+          for svc in gateway-super smtp-inbound-super; do
+            mre=$(ego uniqueid build/${svc})
+            key=$(echo "${svc}" | tr - _)_mrenclave
+            echo "${key}=${mre}" >> "$GITHUB_OUTPUT"
             echo "${svc}: ${mre}"
           done
 
@@ -42,7 +53,9 @@ jobs:
           name: enclaves
           path: |
             build/gateway
+            build/gateway-super
             build/smtp-inbound
+            build/smtp-inbound-super
             build/smtp-outbound
             build/payment
             build/keystore
@@ -55,7 +68,9 @@ jobs:
         with:
           files: |
             build/gateway
+            build/gateway-super
             build/smtp-inbound
+            build/smtp-inbound-super
             build/smtp-outbound
             build/payment
             build/keystore
@@ -71,12 +86,20 @@ jobs:
 
             **Expected MRENCLAVE values** (verify with `curl https://bmail.ag/.well-known/sgx-quotes/<name>`):
 
+            Regular variants (run on SGX1 hosts: fullxp.net + Box 1 + Box 4):
             ```
-            gateway       ${{ steps.mre.outputs.gateway_mrenclave }}
-            smtp-inbound  ${{ steps.mre.outputs.smtp-inbound_mrenclave }}
-            smtp-outbound ${{ steps.mre.outputs.smtp-outbound_mrenclave }}
-            payment       ${{ steps.mre.outputs.payment_mrenclave }}
-            keystore      ${{ steps.mre.outputs.keystore_mrenclave }}
+            gateway              ${{ steps.mre.outputs.gateway_mrenclave }}
+            smtp-inbound         ${{ steps.mre.outputs.smtp-inbound_mrenclave }}
+            smtp-outbound        ${{ steps.mre.outputs.smtp-outbound_mrenclave }}
+            payment              ${{ steps.mre.outputs.payment_mrenclave }}
+            keystore             ${{ steps.mre.outputs.keystore_mrenclave }}
+            ```
+
+            Super variants (run on the SGX2 super-server in production
+            with a 32 GB enclave heap; same source, larger heap):
+            ```
+            gateway-super        ${{ steps.mre.outputs.gateway_super_mrenclave }}
+            smtp-inbound-super   ${{ steps.mre.outputs.smtp_inbound_super_mrenclave }}
             ```
 
             These are the byte sequences EGo signs into the enclave
@@ -93,7 +116,9 @@ jobs:
             Built with EGo v1.8.1 (linux/amd64).
           files: |
             build/gateway
+            build/gateway-super
             build/smtp-inbound
+            build/smtp-inbound-super
             build/smtp-outbound
             build/payment
             build/keystore
