@@ -83,6 +83,13 @@ type DriveFile struct {
 	// ChunkCount is 0 for single-blob files. >0 = number of separately stored
 	// encrypted chunks. Each chunk is at BlobRef + "/N" (0-indexed).
 	ChunkCount           int        `db:"chunk_count"`
+	// UploadComplete is FALSE between chunk-0 INSERT and the last
+	// chunk's MarkUploadComplete call. ListFiles/GetFile filter to
+	// TRUE so partial uploads (account switch, network drop, tab
+	// close) don't surface as phantom "complete" files. Migration
+	// 107 backfills existing rows to TRUE — they're complete by
+	// definition since they exist on a live system.
+	UploadComplete       bool       `db:"upload_complete"`
 	Starred              bool       `db:"starred"`
 	Trashed              bool       `db:"trashed"`
 	TrashedAt            *time.Time `db:"trashed_at"`
@@ -121,7 +128,7 @@ func scanDriveFolder(rows pgx.Rows) (*DriveFolder, error) {
 const driveFileColumns = `file_id, user_id, tenant_id, folder_id,
 	encrypted_name, encrypted_content_type, size_bytes, original_size_bytes, blob_ref,
 	ephemeral_pubkey, encrypted_file_key, fck_wrapped_message_key, epoch, encryption_format,
-	chunk_count,
+	chunk_count, upload_complete,
 	starred, trashed, trashed_at,
 	created_at, updated_at`
 
@@ -131,7 +138,7 @@ func scanDriveFile(rows pgx.Rows) (*DriveFile, error) {
 		&f.FileID, &f.UserID, &f.TenantID, &f.FolderID,
 		&f.EncryptedName, &f.EncryptedContentType, &f.SizeBytes, &f.OriginalSizeBytes, &f.BlobRef,
 		&f.EphemeralPubkey, &f.EncryptedFileKey, &f.FCKWrappedMessageKey, &f.Epoch, &f.EncryptionFormat,
-		&f.ChunkCount,
+		&f.ChunkCount, &f.UploadComplete,
 		&f.Starred, &f.Trashed, &f.TrashedAt,
 		&f.CreatedAt, &f.UpdatedAt,
 	); err != nil {
@@ -384,14 +391,14 @@ func (s *DriveStore) CreateFile(ctx context.Context, f *DriveFile) error {
 		`INSERT INTO drive_files (file_id, user_id, tenant_id, folder_id,
 			encrypted_name, encrypted_content_type, size_bytes, original_size_bytes, blob_ref,
 			ephemeral_pubkey, encrypted_file_key, fck_wrapped_message_key, epoch, encryption_format,
-			chunk_count,
+			chunk_count, upload_complete,
 			starred, trashed, trashed_at,
 			created_at, updated_at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
 		f.FileID, f.UserID, f.TenantID, f.FolderID,
 		f.EncryptedName, f.EncryptedContentType, f.SizeBytes, f.OriginalSizeBytes, f.BlobRef,
 		f.EphemeralPubkey, f.EncryptedFileKey, f.FCKWrappedMessageKey, f.Epoch, f.EncryptionFormat,
-		f.ChunkCount,
+		f.ChunkCount, f.UploadComplete,
 		f.Starred, f.Trashed, f.TrashedAt,
 		f.CreatedAt, f.UpdatedAt,
 	)
@@ -402,11 +409,15 @@ func (s *DriveStore) CreateFile(ctx context.Context, f *DriveFile) error {
 }
 
 // GetFile retrieves a single drive file by ID, scoped to user+tenant.
+// Filters out in-progress chunked uploads (upload_complete = FALSE)
+// so the caller never sees a partial file. The chunked-upload handler
+// itself uses GetFileByID, which has no such filter, to add chunks
+// to a pending row.
 func (s *DriveStore) GetFile(ctx context.Context, userID, tenantID, fileID uuid.UUID) (*DriveFile, error) {
 	rows, err := s.DB.Pool.Query(ctx,
 		`SELECT `+driveFileColumns+`
 		 FROM drive_files
-		 WHERE file_id = $1 AND user_id = $2 AND tenant_id = $3`,
+		 WHERE file_id = $1 AND user_id = $2 AND tenant_id = $3 AND upload_complete = TRUE`,
 		fileID, userID, tenantID,
 	)
 	if err != nil {
@@ -427,7 +438,7 @@ func (s *DriveStore) ListFiles(ctx context.Context, userID, tenantID uuid.UUID, 
 		rows, err = s.DB.Pool.Query(ctx,
 			`SELECT `+driveFileColumns+`
 			 FROM drive_files
-			 WHERE user_id = $1 AND tenant_id = $2 AND folder_id = $3 AND trashed = false
+			 WHERE user_id = $1 AND tenant_id = $2 AND folder_id = $3 AND trashed = false AND upload_complete = TRUE
 			 ORDER BY created_at DESC`,
 			userID, tenantID, *folderID,
 		)
@@ -435,7 +446,7 @@ func (s *DriveStore) ListFiles(ctx context.Context, userID, tenantID uuid.UUID, 
 		rows, err = s.DB.Pool.Query(ctx,
 			`SELECT `+driveFileColumns+`
 			 FROM drive_files
-			 WHERE user_id = $1 AND tenant_id = $2 AND folder_id IS NULL AND trashed = false
+			 WHERE user_id = $1 AND tenant_id = $2 AND folder_id IS NULL AND trashed = false AND upload_complete = TRUE
 			 ORDER BY created_at DESC`,
 			userID, tenantID,
 		)
@@ -503,7 +514,7 @@ func (s *DriveStore) ListStarred(ctx context.Context, userID, tenantID uuid.UUID
 	rows, err := s.DB.Pool.Query(ctx,
 		`SELECT `+driveFileColumns+`
 		 FROM drive_files
-		 WHERE user_id = $1 AND tenant_id = $2 AND starred = true AND trashed = false
+		 WHERE user_id = $1 AND tenant_id = $2 AND starred = true AND trashed = false AND upload_complete = TRUE
 		 ORDER BY updated_at DESC`,
 		userID, tenantID,
 	)
@@ -877,7 +888,7 @@ func (s *DriveStore) ListSharedWithUser(ctx context.Context, recipientUserID, te
 		`SELECT f.file_id, f.user_id, f.tenant_id, f.folder_id,
 		        f.encrypted_name, f.encrypted_content_type, f.size_bytes, f.original_size_bytes, f.blob_ref,
 		        s.recipient_ephemeral_pubkey, s.recipient_encrypted_file_key, f.fck_wrapped_message_key, f.epoch, f.encryption_format,
-		        f.chunk_count,
+		        f.chunk_count, f.upload_complete,
 		        f.starred, f.trashed, f.trashed_at,
 		        f.created_at, f.updated_at,
 		        COALESCE(u.address, '')
@@ -887,6 +898,7 @@ func (s *DriveStore) ListSharedWithUser(ctx context.Context, recipientUserID, te
 		 WHERE s.recipient_user_id = $1 AND s.tenant_id = $2
 		   AND s.share_type = 'user'
 		   AND (s.expires_at IS NULL OR s.expires_at > now())
+		   AND f.upload_complete = TRUE
 		 ORDER BY s.created_at DESC`,
 		recipientUserID, tenantID,
 	)
@@ -903,7 +915,7 @@ func (s *DriveStore) ListSharedWithUser(ctx context.Context, recipientUserID, te
 			&f.FileID, &f.UserID, &f.TenantID, &f.FolderID,
 			&f.EncryptedName, &f.EncryptedContentType, &f.SizeBytes, &f.OriginalSizeBytes, &f.BlobRef,
 			&f.EphemeralPubkey, &f.EncryptedFileKey, &f.FCKWrappedMessageKey, &f.Epoch, &f.EncryptionFormat,
-			&f.ChunkCount,
+			&f.ChunkCount, &f.UploadComplete,
 			&f.Starred, &f.Trashed, &f.TrashedAt,
 			&f.CreatedAt, &f.UpdatedAt,
 			&ownerAddr,
@@ -924,7 +936,7 @@ func (s *DriveStore) GetSharedFile(ctx context.Context, recipientUserID, tenantI
 		`SELECT f.file_id, f.user_id, f.tenant_id, f.folder_id,
 		        f.encrypted_name, f.encrypted_content_type, f.size_bytes, f.original_size_bytes, f.blob_ref,
 		        s.recipient_ephemeral_pubkey, s.recipient_encrypted_file_key, f.fck_wrapped_message_key, f.epoch, f.encryption_format,
-		        f.chunk_count,
+		        f.chunk_count, f.upload_complete,
 		        f.starred, f.trashed, f.trashed_at,
 		        f.created_at, f.updated_at,
 		        COALESCE(u.address, '')
@@ -935,6 +947,7 @@ func (s *DriveStore) GetSharedFile(ctx context.Context, recipientUserID, tenantI
 		   AND s.recipient_user_id = $2 AND s.tenant_id = $3
 		   AND s.share_type = 'user'
 		   AND (s.expires_at IS NULL OR s.expires_at > now())
+		   AND f.upload_complete = TRUE
 		 LIMIT 1`,
 		fileID, recipientUserID, tenantID,
 	)
@@ -944,7 +957,7 @@ func (s *DriveStore) GetSharedFile(ctx context.Context, recipientUserID, tenantI
 		&f.FileID, &f.UserID, &f.TenantID, &f.FolderID,
 		&f.EncryptedName, &f.EncryptedContentType, &f.SizeBytes, &f.OriginalSizeBytes, &f.BlobRef,
 		&f.EphemeralPubkey, &f.EncryptedFileKey, &f.FCKWrappedMessageKey, &f.Epoch, &f.EncryptionFormat,
-		&f.ChunkCount,
+		&f.ChunkCount, &f.UploadComplete,
 		&f.Starred, &f.Trashed, &f.TrashedAt,
 		&f.CreatedAt, &f.UpdatedAt,
 		&ownerAddr,
@@ -985,6 +998,51 @@ func (s *DriveStore) AddFileSize(ctx context.Context, fileID uuid.UUID, addition
 		return fmt.Errorf("add file size: %w", err)
 	}
 	return nil
+}
+
+// MarkUploadComplete flips upload_complete to TRUE. Called by the
+// chunked upload handler when the last chunk arrives. After this,
+// ListFiles/GetFile will surface the file to the user. The handler
+// must call this exactly once per chunked upload — the WHERE clause
+// scopes by file_id only since upload_complete is the load-bearing
+// signal.
+func (s *DriveStore) MarkUploadComplete(ctx context.Context, fileID uuid.UUID) error {
+	_, err := s.DB.Pool.Exec(ctx,
+		`UPDATE drive_files SET upload_complete = TRUE, updated_at = now()
+		 WHERE file_id = $1`,
+		fileID,
+	)
+	if err != nil {
+		return fmt.Errorf("mark upload complete: %w", err)
+	}
+	return nil
+}
+
+// ReapStaleUploads deletes drive_files rows where upload_complete is
+// FALSE and created_at is older than the cutoff. Returns the number
+// of deleted rows. Run periodically by the worker so abandoned
+// chunked uploads (account switch, network failure, tab close) don't
+// accumulate forever. Blob storage cleanup is the caller's
+// responsibility — DELETE here only removes the metadata.
+//
+// Pass the cutoff in seconds (rather than as a Postgres interval
+// literal) because time.Duration.String returns Go-style notation
+// like "1h30m0s" that Postgres can't parse directly.
+func (s *DriveStore) ReapStaleUploads(ctx context.Context, olderThan time.Duration) (int64, error) {
+	seconds := int64(olderThan.Seconds())
+	if seconds <= 0 {
+		seconds = 1
+	}
+	tag, err := s.DB.Pool.Exec(ctx,
+		`DELETE FROM drive_files
+		 WHERE upload_complete = FALSE
+		   AND created_at < now() - ($1::bigint * INTERVAL '1 second')`,
+		seconds,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("reap stale uploads: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 // GetStorageUsed returns the total bytes used and file count for a user.
@@ -1389,7 +1447,7 @@ func (s *DriveStore) ListSharedFolderContents(
 		`SELECT f.file_id, f.user_id, f.tenant_id, f.folder_id,
 		        f.encrypted_name, f.encrypted_content_type, f.size_bytes, f.original_size_bytes, f.blob_ref,
 		        f.ephemeral_pubkey, f.encrypted_file_key, f.fck_wrapped_message_key, f.epoch, f.encryption_format,
-		        f.chunk_count,
+		        f.chunk_count, f.upload_complete,
 		        f.starred, f.trashed, f.trashed_at,
 		        f.created_at, f.updated_at,
 		        COALESCE(u.address, '')
@@ -1398,6 +1456,7 @@ func (s *DriveStore) ListSharedFolderContents(
 		  WHERE f.folder_id = $1
 		    AND f.tenant_id = $2
 		    AND f.trashed = false
+		    AND f.upload_complete = TRUE
 		  ORDER BY f.created_at DESC`,
 		folderID, tenantID,
 	)
@@ -1414,7 +1473,7 @@ func (s *DriveStore) ListSharedFolderContents(
 			&f.FileID, &f.UserID, &f.TenantID, &f.FolderID,
 			&f.EncryptedName, &f.EncryptedContentType, &f.SizeBytes, &f.OriginalSizeBytes, &f.BlobRef,
 			&f.EphemeralPubkey, &f.EncryptedFileKey, &f.FCKWrappedMessageKey, &f.Epoch, &f.EncryptionFormat,
-			&f.ChunkCount,
+			&f.ChunkCount, &f.UploadComplete,
 			&f.Starred, &f.Trashed, &f.TrashedAt,
 			&f.CreatedAt, &f.UpdatedAt,
 			&ownerAddr,
