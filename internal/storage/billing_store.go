@@ -2,8 +2,10 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -68,6 +70,66 @@ func (s *BillingStore) AddCredit(ctx context.Context, credit *BillingCredit) err
 		return fmt.Errorf("add billing credit: %w", err)
 	}
 	return nil
+}
+
+// AddCompCredit inserts a billing credit on behalf of an admin /
+// marketing user, atomic with the user's tier flip to mail. Used by
+// /admin/users/{id}/comp-free to give a free user paid status for a
+// finite window without going through Stripe.
+//
+// token_hash is set to a deterministic sha256("admin-comp:"+credit_id)
+// so the column's NOT NULL constraint stays satisfied without
+// inventing a real voucher token. comped_by_user_id + comp_reason
+// (migration 108) record who issued the comp and why for finance.
+//
+// Returns the credit row so the handler can audit-log and report it.
+func (s *BillingStore) AddCompCredit(ctx context.Context, tenantID, userID, compedBy uuid.UUID, tier string, mailboxQuota int, validUntil time.Time, reason string) (*BillingCredit, error) {
+	creditID := uuid.New()
+	now := time.Now()
+	tokenHash := sha256.Sum256([]byte("admin-comp:" + creditID.String()))
+
+	tx, err := s.DB.Pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin comp tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	_, err = tx.Exec(ctx,
+		`INSERT INTO billing_credits
+		   (credit_id, tenant_id, tier, mailbox_quota, valid_from, valid_until,
+		    token_hash, price_cents_each, comped_by_user_id, comp_reason)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, NULLIF($9, ''))`,
+		creditID, tenantID, tier, mailboxQuota, now, validUntil,
+		tokenHash[:], compedBy, reason,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("insert comp credit: %w", err)
+	}
+
+	// Flip the user's tier so the paid storage / mailbox limits take
+	// effect immediately. The lifecycle cron will flip it back when
+	// the credit expires (same path as voucher expiry).
+	if _, err := tx.Exec(ctx,
+		`UPDATE users SET tier = $2 WHERE user_id = $1`, userID, tier,
+	); err != nil {
+		return nil, fmt.Errorf("flip user tier: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit comp tx: %w", err)
+	}
+
+	return &BillingCredit{
+		CreditID:       creditID,
+		TenantID:       tenantID,
+		Tier:           tier,
+		MailboxQuota:   mailboxQuota,
+		ValidFrom:      now,
+		ValidUntil:     validUntil,
+		TokenHash:      tokenHash[:],
+		PriceCentsEach: 0,
+		CreatedAt:      now,
+	}, nil
 }
 
 // GetActiveMailboxQuota returns the total active mailbox quota for a tenant.
