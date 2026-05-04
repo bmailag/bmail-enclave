@@ -1226,6 +1226,100 @@ func (s *AuthStore) MarkLapsedToFree(ctx context.Context, cutoff time.Time) ([]L
 	return scanLifecycleRows(rows)
 }
 
+// ExpiredCreditCandidate is one row in the expired-credit downgrade
+// candidate list shown in the admin panel. last_credit_until is the
+// MAX(valid_until) across the user's billing_credits — the moment the
+// last one expired.
+type ExpiredCreditCandidate struct {
+	UserID          uuid.UUID
+	TenantID        uuid.UUID
+	Address         string
+	Tier            string
+	LastCreditUntil time.Time
+}
+
+// ListExpiredCreditCandidates returns primary accounts where every
+// billing_credit row has expired and there is no active recurring
+// subscription (Stripe / Apple IAP / Google IAP). Pure SELECT — no
+// rows are modified. The INNER JOIN on billing_credits is deliberate:
+// it skips users who never had a credit row at all (Stripe-paid, or
+// pre-fix voucher redemptions where the credit insert silently failed).
+// Those shapes need manual review, not automatic downgrade.
+//
+// The cron logs this list every tick for an audit trail. The actual
+// downgrade is initiated by an admin via the panel.
+func (s *AuthStore) ListExpiredCreditCandidates(ctx context.Context) ([]ExpiredCreditCandidate, error) {
+	rows, err := s.DB.Pool.Query(ctx, `
+SELECT u.user_id, u.tenant_id, u.address, u.tier, MAX(bc.valid_until)
+FROM users u
+JOIN billing_credits bc ON bc.tenant_id = u.tenant_id
+WHERE u.tier <> 'free'
+  AND u.account_status = 'active'
+  AND COALESCE(u.account_type, 'primary') = 'primary'
+  AND u.stripe_subscription_id IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM apple_subscriptions s
+      WHERE s.user_id = u.user_id AND s.status = 'active'
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM google_subscriptions s
+      WHERE s.user_id = u.user_id AND s.status = 'active'
+  )
+GROUP BY u.user_id, u.tenant_id, u.address, u.tier
+HAVING MAX(bc.valid_until) < now()
+ORDER BY MAX(bc.valid_until) ASC, u.address`)
+	if err != nil {
+		return nil, fmt.Errorf("list expired credit candidates: %w", err)
+	}
+	defer rows.Close()
+	out := []ExpiredCreditCandidate{}
+	for rows.Next() {
+		var c ExpiredCreditCandidate
+		if err := rows.Scan(&c.UserID, &c.TenantID, &c.Address, &c.Tier, &c.LastCreditUntil); err != nil {
+			return nil, fmt.Errorf("scan expired credit candidate: %w", err)
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// IsExpiredCreditCandidate re-checks whether a single user still
+// matches the candidate query. Used by the admin downgrade handler so
+// a stale UI selection from a few minutes ago can't accidentally
+// downgrade a user whose situation just changed (renewal, new comp,
+// etc.). Returns the candidate row if still eligible; nil if not.
+func (s *AuthStore) IsExpiredCreditCandidate(ctx context.Context, userID uuid.UUID) (*ExpiredCreditCandidate, error) {
+	row := s.DB.Pool.QueryRow(ctx, `
+SELECT u.user_id, u.tenant_id, u.address, u.tier, MAX(bc.valid_until)
+FROM users u
+JOIN billing_credits bc ON bc.tenant_id = u.tenant_id
+WHERE u.user_id = $1
+  AND u.tier <> 'free'
+  AND u.account_status = 'active'
+  AND COALESCE(u.account_type, 'primary') = 'primary'
+  AND u.stripe_subscription_id IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM apple_subscriptions s
+      WHERE s.user_id = u.user_id AND s.status = 'active'
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM google_subscriptions s
+      WHERE s.user_id = u.user_id AND s.status = 'active'
+  )
+GROUP BY u.user_id, u.tenant_id, u.address, u.tier
+HAVING MAX(bc.valid_until) < now()`,
+		userID,
+	)
+	var c ExpiredCreditCandidate
+	if err := row.Scan(&c.UserID, &c.TenantID, &c.Address, &c.Tier, &c.LastCreditUntil); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("recheck expired credit candidate: %w", err)
+	}
+	return &c, nil
+}
+
 // MarkDormantTombstone finds active tier='free' accounts inactive for
 // longer than the cutoff and flips them to tombstone. The actual data
 // wipe is handled by the PurgeUser pipeline (which preserves auth
