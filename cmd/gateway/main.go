@@ -371,6 +371,19 @@ func run() error {
 	})
 	mux.Handle("/.well-known/sgx-quotes/{name}", sgxProxy)
 
+	// /.well-known/apple-app-site-association — Apple Universal Links
+	// require this file with no extension AND a strict Content-Type of
+	// application/json. The static FileServer returns text/plain for
+	// extensionless files (DetectContentType doesn't recognize JSON),
+	// so we override the header here and delegate to ServeFile for the
+	// actual byte read out of /var/www/bmail/.well-known/. The file is
+	// shipped from web/public/.well-known/apple-app-site-association
+	// via the standard frontend deploy pipeline.
+	mux.HandleFunc("/.well-known/apple-app-site-association", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		http.ServeFile(w, r, filepath.Join(webRoot, ".well-known/apple-app-site-association"))
+	})
+
 	// robots.txt — disallow all on non-production (test/staging) servers.
 	if os.Getenv("NOINDEX") == "true" {
 		mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
