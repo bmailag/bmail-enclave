@@ -608,9 +608,9 @@ func (s *AuthStore) UpdateUserKEMKeys(ctx context.Context, userID uuid.UUID, pub
 // CreateSession inserts a new session into the sessions table.
 func (s *AuthStore) CreateSession(ctx context.Context, sess *Session) error {
 	_, err := s.DB.Pool.Exec(ctx,
-		`INSERT INTO sessions (session_id, user_id, created_at, expires_at, refresh_token_hash, token_hash)
-		 VALUES ($1, $2, $3, $4, $5, $6)`,
-		sess.SessionID, sess.UserID, sess.CreatedAt, sess.ExpiresAt, sess.RefreshTokenHash, sess.TokenHash,
+		`INSERT INTO sessions (session_id, user_id, created_at, expires_at, refresh_expires_at, refresh_token_hash, token_hash)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		sess.SessionID, sess.UserID, sess.CreatedAt, sess.ExpiresAt, sess.RefreshExpiresAt, sess.RefreshTokenHash, sess.TokenHash,
 	)
 	if err != nil {
 		return fmt.Errorf("create session: %w", err)
@@ -618,14 +618,14 @@ func (s *AuthStore) CreateSession(ctx context.Context, sess *Session) error {
 	return nil
 }
 
-// GetSession retrieves a session by its ID if it has not expired.
+// GetSession retrieves a session by its ID if its bearer token has not expired.
 func (s *AuthStore) GetSession(ctx context.Context, sessionID uuid.UUID) (*Session, error) {
 	sess := &Session{}
 	err := s.DB.Pool.QueryRow(ctx,
-		`SELECT session_id, user_id, created_at, expires_at, refresh_token_hash, COALESCE(token_hash, ''::bytea)
+		`SELECT session_id, user_id, created_at, expires_at, refresh_expires_at, refresh_token_hash, COALESCE(token_hash, ''::bytea)
 		 FROM sessions WHERE session_id = $1 AND expires_at > now()`, sessionID,
 	).Scan(
-		&sess.SessionID, &sess.UserID, &sess.CreatedAt, &sess.ExpiresAt, &sess.RefreshTokenHash, &sess.TokenHash,
+		&sess.SessionID, &sess.UserID, &sess.CreatedAt, &sess.ExpiresAt, &sess.RefreshExpiresAt, &sess.RefreshTokenHash, &sess.TokenHash,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("session not found or expired: %s", sessionID)
@@ -640,10 +640,10 @@ func (s *AuthStore) GetSession(ctx context.Context, sessionID uuid.UUID) (*Sessi
 func (s *AuthStore) GetSessionByTokenHash(ctx context.Context, tokenHash []byte) (*Session, error) {
 	sess := &Session{}
 	err := s.DB.Pool.QueryRow(ctx,
-		`SELECT session_id, user_id, created_at, expires_at, refresh_token_hash, token_hash
+		`SELECT session_id, user_id, created_at, expires_at, refresh_expires_at, refresh_token_hash, token_hash
 		 FROM sessions WHERE token_hash = $1 AND expires_at > now()`, tokenHash,
 	).Scan(
-		&sess.SessionID, &sess.UserID, &sess.CreatedAt, &sess.ExpiresAt, &sess.RefreshTokenHash, &sess.TokenHash,
+		&sess.SessionID, &sess.UserID, &sess.CreatedAt, &sess.ExpiresAt, &sess.RefreshExpiresAt, &sess.RefreshTokenHash, &sess.TokenHash,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("session not found or expired for token hash")
@@ -670,14 +670,19 @@ func HashSessionToken(token []byte) []byte {
 	return h[:]
 }
 
-// GetSessionByRefreshHash finds a non-expired session by its refresh token hash.
+// GetSessionByRefreshHash finds a session by its refresh token hash whose
+// REFRESH window is still valid. The bearer token's expires_at is allowed
+// to be in the past — that's the whole point of refresh: we exchange an
+// expired bearer for a fresh one. Refresh validity is gated separately by
+// refresh_expires_at, which is set to 90 days at session creation and
+// renewed on every successful refresh.
 func (s *AuthStore) GetSessionByRefreshHash(ctx context.Context, refreshHash []byte) (*Session, error) {
 	sess := &Session{}
 	err := s.DB.Pool.QueryRow(ctx,
-		`SELECT session_id, user_id, created_at, expires_at, refresh_token_hash, COALESCE(token_hash, ''::bytea)
-		 FROM sessions WHERE refresh_token_hash = $1 AND expires_at > now()`, refreshHash,
+		`SELECT session_id, user_id, created_at, expires_at, refresh_expires_at, refresh_token_hash, COALESCE(token_hash, ''::bytea)
+		 FROM sessions WHERE refresh_token_hash = $1 AND refresh_expires_at > now()`, refreshHash,
 	).Scan(
-		&sess.SessionID, &sess.UserID, &sess.CreatedAt, &sess.ExpiresAt, &sess.RefreshTokenHash, &sess.TokenHash,
+		&sess.SessionID, &sess.UserID, &sess.CreatedAt, &sess.ExpiresAt, &sess.RefreshExpiresAt, &sess.RefreshTokenHash, &sess.TokenHash,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("session not found or expired for refresh token")
@@ -703,10 +708,13 @@ func (s *AuthStore) DeleteSession(ctx context.Context, sessionID uuid.UUID) erro
 }
 
 // UpdateSessionRefresh updates a session's expiry and refresh token hash atomically.
-func (s *AuthStore) UpdateSessionRefresh(ctx context.Context, sessionID uuid.UUID, expiresAt time.Time, newRefreshHash []byte) error {
+// Both the bearer-token expiry (expires_at) and the refresh-token expiry
+// (refresh_expires_at) slide forward — refresh has "rolling" semantics so
+// an active client never has to re-auth.
+func (s *AuthStore) UpdateSessionRefresh(ctx context.Context, sessionID uuid.UUID, expiresAt, refreshExpiresAt time.Time, newRefreshHash []byte) error {
 	tag, err := s.DB.Pool.Exec(ctx,
-		`UPDATE sessions SET expires_at = $2, refresh_token_hash = $3 WHERE session_id = $1`,
-		sessionID, expiresAt, newRefreshHash,
+		`UPDATE sessions SET expires_at = $2, refresh_expires_at = $3, refresh_token_hash = $4 WHERE session_id = $1`,
+		sessionID, expiresAt, refreshExpiresAt, newRefreshHash,
 	)
 	if err != nil {
 		return fmt.Errorf("update session refresh: %w", err)
@@ -717,11 +725,13 @@ func (s *AuthStore) UpdateSessionRefresh(ctx context.Context, sessionID uuid.UUI
 	return nil
 }
 
-// UpdateSessionRefreshAndToken updates a session's expiry, refresh token hash, and bearer token hash atomically.
-func (s *AuthStore) UpdateSessionRefreshAndToken(ctx context.Context, sessionID uuid.UUID, expiresAt time.Time, newRefreshHash, newTokenHash []byte) error {
+// UpdateSessionRefreshAndToken updates a session's bearer + refresh expiries
+// and both token hashes atomically. Used by the /auth/refresh round-trip
+// which rotates everything in a single SQL statement.
+func (s *AuthStore) UpdateSessionRefreshAndToken(ctx context.Context, sessionID uuid.UUID, expiresAt, refreshExpiresAt time.Time, newRefreshHash, newTokenHash []byte) error {
 	tag, err := s.DB.Pool.Exec(ctx,
-		`UPDATE sessions SET expires_at = $2, refresh_token_hash = $3, token_hash = $4 WHERE session_id = $1`,
-		sessionID, expiresAt, newRefreshHash, newTokenHash,
+		`UPDATE sessions SET expires_at = $2, refresh_expires_at = $3, refresh_token_hash = $4, token_hash = $5 WHERE session_id = $1`,
+		sessionID, expiresAt, refreshExpiresAt, newRefreshHash, newTokenHash,
 	)
 	if err != nil {
 		return fmt.Errorf("update session refresh and token: %w", err)
@@ -827,11 +837,15 @@ func (s *AuthStore) DeleteUser(ctx context.Context, userID uuid.UUID) error {
 	return tx.Commit(ctx)
 }
 
-// ListSessions returns all non-expired sessions for a user.
+// ListSessions returns all sessions for a user whose refresh window is
+// still valid. A session whose bearer expired but whose refresh hasn't
+// is still considered "active" for management UI purposes — the client
+// can resurrect it on the next /auth/refresh, and the user typically
+// expects to see it in their device list either way.
 func (s *AuthStore) ListSessions(ctx context.Context, userID uuid.UUID) ([]*Session, error) {
 	rows, err := s.DB.Pool.Query(ctx,
-		`SELECT session_id, user_id, created_at, expires_at, refresh_token_hash, COALESCE(token_hash, ''::bytea)
-		 FROM sessions WHERE user_id = $1 AND expires_at > now() ORDER BY created_at DESC`, userID,
+		`SELECT session_id, user_id, created_at, expires_at, refresh_expires_at, refresh_token_hash, COALESCE(token_hash, ''::bytea)
+		 FROM sessions WHERE user_id = $1 AND refresh_expires_at > now() ORDER BY created_at DESC`, userID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list sessions: %w", err)
@@ -842,7 +856,7 @@ func (s *AuthStore) ListSessions(ctx context.Context, userID uuid.UUID) ([]*Sess
 	for rows.Next() {
 		sess := &Session{}
 		if err := rows.Scan(
-			&sess.SessionID, &sess.UserID, &sess.CreatedAt, &sess.ExpiresAt, &sess.RefreshTokenHash, &sess.TokenHash,
+			&sess.SessionID, &sess.UserID, &sess.CreatedAt, &sess.ExpiresAt, &sess.RefreshExpiresAt, &sess.RefreshTokenHash, &sess.TokenHash,
 		); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}

@@ -71,6 +71,13 @@ type Session struct {
 	UserID           uuid.UUID `db:"user_id"`
 	CreatedAt        time.Time `db:"created_at"`
 	ExpiresAt        time.Time `db:"expires_at"`
+	// RefreshExpiresAt is when the refresh token itself becomes
+	// invalid — distinct from ExpiresAt, which only governs the
+	// short-lived bearer token. Set far in the future at session
+	// creation (90 days) and renewed on every /auth/refresh, so a
+	// client that calls refresh at least once per 90 days stays
+	// signed in indefinitely without forcing the user to re-auth.
+	RefreshExpiresAt time.Time `db:"refresh_expires_at"`
 	RefreshTokenHash []byte    `db:"refresh_token_hash"`
 	TokenHash        []byte    `db:"token_hash"`
 }
