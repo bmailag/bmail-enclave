@@ -24,6 +24,7 @@ import (
 	"crypto/subtle"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -587,10 +588,18 @@ func handleAttestation(svc *payment.PaymentService, runtime tee.TEERuntime) http
 			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "attestation failed"})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]string{
+		// F-02b: expose the concatenated tier-pubkey DER bytes the
+		// quote's REPORTDATA is hashed from. The /verify page bases64-
+		// decodes this, re-hashes, and compares to REPORTDATA[:32] for
+		// an independent bind check — same guarantee as gateway /
+		// smtp-inbound / smtp-outbound provide via tls_public_key. The
+		// tier pubkeys are public (used by blind-sig clients) so
+		// publishing them here doesn't leak anything.
+		writeJSON(w, http.StatusOK, map[string]any{
 			"attestation_report":  hex.EncodeToString(report),
 			"enclave_measurement": runtime.SelfID(),
 			"timestamp":           time.Now().UTC().Format(time.RFC3339),
+			"tier_pubkeys_der":    base64.StdEncoding.EncodeToString(raw),
 		})
 	}
 }
