@@ -558,6 +558,26 @@ func (s *AuthStore) UpdateUserKeys(ctx context.Context, userID uuid.UUID, encryp
 	return nil
 }
 
+// UpdateEncryptedRecoveryKey replaces only the encrypted_recovery_key
+// blob and recovery_version. Used by the F-07 V2→V3 silent migration
+// in recovery_flow.go: when a recovery succeeds via the V2 fallback,
+// we re-wrap the plaintext recovery key under the V3-derived key so
+// the next recovery doesn't need V2 anymore. Leaves all OPAQUE +
+// private-key fields untouched.
+func (s *AuthStore) UpdateEncryptedRecoveryKey(ctx context.Context, userID uuid.UUID, encryptedRecoveryKey []byte, recoveryVersion int) error {
+	tag, err := s.DB.Pool.Exec(ctx,
+		`UPDATE users SET encrypted_recovery_key = $2, recovery_version = $3 WHERE user_id = $1`,
+		userID, encryptedRecoveryKey, recoveryVersion,
+	)
+	if err != nil {
+		return fmt.Errorf("update encrypted recovery key: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("user not found: %s", userID)
+	}
+	return nil
+}
+
 // UpdateRecoveryOPAQUE updates the OPAQUE-based recovery data for a user.
 func (s *AuthStore) UpdateRecoveryOPAQUE(ctx context.Context, userID uuid.UUID, opaqueRecoveryReg, recoveryBlob []byte) error {
 	tag, err := s.DB.Pool.Exec(ctx,

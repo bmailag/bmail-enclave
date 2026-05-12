@@ -21,6 +21,12 @@ type sgxQuotesProxy struct {
 	teeRuntime tee.TEERuntime
 	upstreams  map[string]string // name -> URL (empty value disables that name)
 	client     *http.Client
+	// F-02b: identity key + live-TLS-pubkey closure for the local
+	// "gateway" case. Passed through to AttestationHandlerWithIdentity
+	// so the proxy's gateway response matches what /gateway/attestation
+	// on the main mux returns (same REPORTDATA binding, same JSON).
+	gatewayIdentityPub []byte
+	gatewayTLSPubKeyFn func() []byte
 }
 
 func newSGXQuotesProxy(teeRuntime tee.TEERuntime, upstreams map[string]string) *sgxQuotesProxy {
@@ -61,11 +67,11 @@ func (p *sgxQuotesProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// goes 404 so we never proxy arbitrary names a typo could create.
 	switch name {
 	case "gateway":
-		// Serve our own attestation locally. AttestationHandler does
-		// the same Attest() / SelfID() / JSON shape the upstream
-		// /attestation handlers do, so the /verify page sees one
-		// uniform response shape across all four rows.
-		gateway.AttestationHandler(p.teeRuntime, nil).ServeHTTP(w, r)
+		// Serve our own attestation locally. Same Plan-B binding shape
+		// as the /gateway/attestation route: REPORTDATA = sha256(
+		// identity_public_key); response also includes the current
+		// autocert TLS pubkey via the closure for browser cross-check.
+		gateway.AttestationHandlerWithIdentity(p.teeRuntime, p.gatewayIdentityPub, p.gatewayTLSPubKeyFn).ServeHTTP(w, r)
 		return
 	case "smtp-inbound", "smtp-outbound", "payment", "keystore":
 		upstream := p.upstreams[name]

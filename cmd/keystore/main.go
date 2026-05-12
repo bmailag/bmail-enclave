@@ -114,6 +114,17 @@ func run() error {
 	// The quote is public material — signed by Intel — so plaintext is
 	// fine. The mTLS listener stays for the actual key-fetching RPCs.
 	healthMux := http.NewServeMux()
+	// F-02b: keystore TLS-bind is DEFERRED until a planned MRENCLAVE
+	// migration. Reason: the keystore seals all its state (audit log,
+	// allowlist, key blobs) under MRENCLAVE-Unique via SealUnique /
+	// UnsealUnique. Any source change here drifts MRENCLAVE, which
+	// means the new binary can no longer unseal the data the old one
+	// wrote — restart and the keystore is a brick (DKIM keys gone,
+	// audit chain broken, allowlist empty). Until we ship a key
+	// export/import migration tool, leave attestation un-bound (nil)
+	// so the source MRENCLAVE matches what's already running and
+	// holding the sealed data. The /verify page's bind row will read
+	// "no signed public key" for keystore, which is correct.
 	healthMux.HandleFunc("GET /attestation", gateway.AttestationHandler(runtime, nil))
 	healthSrv := &http.Server{
 		Addr:              healthListen,

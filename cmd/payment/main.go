@@ -36,6 +36,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -190,14 +191,11 @@ func run() error {
 		svc = payment.NewPaymentService(signingKeys, processors)
 	}
 
-	metrics := gateway.NewMetrics()
-
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", gateway.HealthHandler())
 	rc := gateway.NewReadinessChecker()
 	rc.Add("postgres", func(ctx context.Context) error { return db.Pool.Ping(ctx) })
 	mux.HandleFunc("GET /readyz", rc.Handler())
-	mux.HandleFunc("GET /metrics", metrics.MetricsHandler())
 	registerRoutes(mux, svc, paymentStore, runtime, fakeidSlotDeps{
 		svc:          svc,
 		paymentStore: paymentStore,
@@ -209,6 +207,23 @@ func run() error {
 	addr := os.Getenv("PAYMENT_ADDR")
 	if addr == "" {
 		addr = ":8085"
+	}
+
+	// Durability snapshots of payment's sealed key files. See
+	// docs/runbooks/key-backup-and-recovery.md. Files are MRSIGNER-
+	// sealed, so any payment binary signed by the same private.pem
+	// can unseal them — bytes-to-R2 is sufficient for full recovery.
+	if snapper, err := buildPaymentSnapshotter(); err != nil {
+		return fmt.Errorf("build payment snapshotter: %v", err)
+	} else if snapper != nil {
+		snapFiles := paymentSnapshotFiles()
+		snapCtx, snapCancel := context.WithCancel(ctx)
+		defer snapCancel()
+		go payment.RunDailySnapshotter(snapCtx, snapper, snapFiles, slog.Default())
+		slog.Info("payment snapshot pipeline armed",
+			"files", len(snapFiles))
+	} else if os.Getenv("VP_ENV") == "production" {
+		return fmt.Errorf("PAYMENT_SNAPSHOT_S3_* or PAYMENT_SNAPSHOT_LOCAL_DIR must be set in production (key-backup runbook)")
 	}
 
 	// Limit request bodies to 1MB to prevent DoS.
@@ -683,4 +698,69 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(v)
+}
+
+// paymentSnapshotFiles returns the list of sealed paths to back up
+// per the runbook. Override with PAYMENT_SNAPSHOT_FILES (comma-
+// separated absolute paths) if the operator wants a custom set.
+func paymentSnapshotFiles() []string {
+	if csv := os.Getenv("PAYMENT_SNAPSHOT_FILES"); csv != "" {
+		var out []string
+		for _, p := range strings.Split(csv, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				out = append(out, p)
+			}
+		}
+		return out
+	}
+	base := []string{
+		"sealed_payment_key_business.bin",
+		"sealed_payment_key_paid.bin",
+		"sealed_payment_key_pro.bin",
+		"sealed_payment_key_fakeid_mint.bin",
+		"sealed_payment_key_fakeid_ratchet.bin",
+		"sealed_fakeid_attestation_key.bin",
+		"sealed_fakeid_tag_key.bin",
+		"sealed_payment_tls_key.bin",
+	}
+	out := make([]string, 0, len(base))
+	for _, b := range base {
+		out = append(out, "/opt/bmail/sealed/"+b)
+	}
+	return out
+}
+
+// buildPaymentSnapshotter inspects PAYMENT_SNAPSHOT_* env vars and
+// returns a Snapshotter. Returns (nil, nil) if no backup target is
+// configured (caller decides whether that's fatal — production runs
+// reject this).
+//
+// Precedence: S3 endpoint configured → S3Snapshotter; else local
+// dir configured → LocalFSSnapshotter; else nil.
+func buildPaymentSnapshotter() (payment.Snapshotter, error) {
+	endpoint := os.Getenv("PAYMENT_SNAPSHOT_S3_ENDPOINT")
+	bucket := os.Getenv("PAYMENT_SNAPSHOT_S3_BUCKET")
+	if endpoint != "" || bucket != "" {
+		if endpoint == "" || bucket == "" {
+			return nil, fmt.Errorf("PAYMENT_SNAPSHOT_S3_ENDPOINT and PAYMENT_SNAPSHOT_S3_BUCKET must both be set")
+		}
+		prefix := os.Getenv("PAYMENT_SNAPSHOT_S3_PREFIX")
+		if prefix == "" {
+			prefix = "payment-snapshots/"
+		}
+		return payment.NewS3Snapshotter(
+			endpoint,
+			os.Getenv("PAYMENT_SNAPSHOT_S3_ACCESS_KEY"),
+			os.Getenv("PAYMENT_SNAPSHOT_S3_SECRET_KEY"),
+			bucket,
+			prefix,
+			os.Getenv("PAYMENT_SNAPSHOT_S3_INSECURE") != "1",
+			slog.Default(),
+		)
+	}
+	if dir := os.Getenv("PAYMENT_SNAPSHOT_LOCAL_DIR"); dir != "" {
+		return &payment.LocalFSSnapshotter{Dir: dir, Logger: slog.Default()}, nil
+	}
+	return nil, nil
 }

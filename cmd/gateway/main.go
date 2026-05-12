@@ -12,9 +12,11 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -36,6 +38,7 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 
 	"github.com/bmailag/bmail/internal/gateway"
+	"github.com/bmailag/bmail/internal/security"
 	"github.com/bmailag/bmail/internal/tee"
 )
 
@@ -92,6 +95,47 @@ func run() error {
 
 	teeRuntime := tee.NewRuntime()
 	slog.Info("TEE runtime", "id", teeRuntime.SelfID())
+
+	// Gateway enclave identity keypair (F-02b / Plan B).
+	//
+	// Autocert rotates the gateway's TLS key every ~60d for cert
+	// renewal, so we can't bind the SGX quote's REPORTDATA directly
+	// to it. Instead we generate a stable Ed25519 identity keypair
+	// at first boot, MRENCLAVE-seal the private half, and bind the
+	// public half into REPORTDATA. The attestation JSON also returns
+	// the CURRENT TLS public key the cert presents — auditors check:
+	//
+	//   1. report.REPORTDATA == sha256(identity_public_key)   (enclave proves it owns the identity)
+	//   2. tls_public_key    == SPKI of the cert their TLS    (the cert is the one this enclave presents)
+	//      stack actually received
+	//
+	// MRENCLAVE-seal so the identity ROTATES on every code change.
+	// That's the right property here — verifiers re-fetch /verify
+	// after each deploy anyway, and tying the identity to specific
+	// code prevents a hypothetical "compromised v1.0 keeps acting as
+	// identity holder after upgrade" mode.
+	identityKeyPath := os.Getenv("GATEWAY_IDENTITY_KEY_PATH")
+	if identityKeyPath == "" {
+		identityKeyPath = "/opt/bmail/sealed/sealed_gateway_identity.bin"
+	}
+	identityPrivBytes, err := tee.LoadOrSealUniqueBytes(teeRuntime, identityKeyPath, func() ([]byte, error) {
+		_, priv, gerr := teeRuntime.GenerateKey("ed25519")
+		return priv, gerr
+	})
+	if err != nil {
+		return fmt.Errorf("gateway identity key: %w", err)
+	}
+	if len(identityPrivBytes) != ed25519.PrivateKeySize {
+		return fmt.Errorf("gateway identity key wrong size: %d", len(identityPrivBytes))
+	}
+	identityPriv := ed25519.PrivateKey(identityPrivBytes)
+	identityPub := identityPriv.Public().(ed25519.PublicKey)
+	slog.Info("gateway identity key loaded", "pubkey_bytes", len(identityPub))
+
+	// Forward-declared so the attestation handler can fetch the
+	// current TLS pubkey at request time. Populated below inside the
+	// autocert branch; stays nil on the plaintext-HTTP dev path.
+	var autocertMgr *autocert.Manager
 
 	// ── Rate Limiter (privacy-preserving, IP-based) ─────────────────────
 
@@ -355,7 +399,13 @@ func run() error {
 	})
 
 	// Attestation endpoint — proves this is the real enclave.
-	mux.Handle("/gateway/attestation", gateway.AttestationHandler(teeRuntime, nil))
+	// Plan B (F-02b): REPORTDATA binds to a stable enclave identity
+	// key; the response also returns the CURRENT autocert TLS pubkey
+	// so auditors can cross-check the cert their browser saw.
+	tlsPubKeyFn := func() []byte {
+		return currentAutocertSPKI(autocertMgr, domains)
+	}
+	mux.Handle("/gateway/attestation", gateway.AttestationHandlerWithIdentity(teeRuntime, identityPub, tlsPubKeyFn))
 
 	// /.well-known/sgx-quotes/{name} — single-origin proxy that fans
 	// out to the four enclaves' attestation endpoints. The /verify page
@@ -369,7 +419,18 @@ func run() error {
 		"payment":       os.Getenv("ATTESTATION_URL_PAYMENT"),
 		"keystore":      os.Getenv("ATTESTATION_URL_KEYSTORE"),
 	})
+	sgxProxy.gatewayIdentityPub = identityPub
+	sgxProxy.gatewayTLSPubKeyFn = tlsPubKeyFn
 	mux.Handle("/.well-known/sgx-quotes/{name}", sgxProxy)
+
+	// /verify/latest-release + /verify/latest-enclave-release —
+	// server-side proxies for the GitHub release JSON the /verify page
+	// used to fetch directly from api.github.com (F-36). Removing the
+	// browser-side fetch lets us drop api.github.com from connect-src
+	// CSP, closing the "any XSS can exfil to a Gist" amplifier.
+	relProxy := newReleaseProxy()
+	mux.Handle("/verify/latest-release", relProxy)
+	mux.Handle("/verify/latest-enclave-release", relProxy)
 
 	// /.well-known/apple-app-site-association — Apple Universal Links
 	// require this file with no extension AND a strict Content-Type of
@@ -410,6 +471,14 @@ func run() error {
 	})
 
 	handler := http.Handler(mux)
+	// F-35: apply the standard SecurityHeaders set (CSP, HSTS,
+	// X-Frame-Options, etc.) at the HTTP layer for SPA + static
+	// responses. The backend already wraps its mux with this; the
+	// gateway wasn't, so meta-CSP in index.html was the only CSP and
+	// HSTS in particular wasn't honoured (meta http-equiv HSTS is
+	// ignored by browsers). Wrap before the host-redirect middleware
+	// so the headers also apply to the 301 redirect responses.
+	handler = security.SecurityHeaders(handler)
 
 	// Redirect non-primary domains to the primary domain (first in GATEWAY_DOMAINS).
 	// Exceptions: /.well-known/ paths are served from any hostname (MTA-STS, ACME, security.txt).
@@ -455,6 +524,11 @@ func run() error {
 			Cache:      sealedCache,
 			Email:      "andrew@vp.net",
 		}
+		// Expose the live manager so the /gateway/attestation handler
+		// can read the current cert SPKI per request (the cert rotates
+		// on autocert's ~60d cycle; REPORTDATA stays bound to the
+		// stable identity key set above).
+		autocertMgr = m
 
 		// Optional: switch ACME directory away from Let's Encrypt.
 		// Set ACME_DIRECTORY_URL to point at a different CA's ACME
@@ -807,6 +881,34 @@ func webrootACMEFirst(webroot string, next http.Handler) http.Handler {
 		w.Header().Set("Content-Type", "text/plain")
 		w.Write(data)
 	})
+}
+
+// currentAutocertSPKI returns the SubjectPublicKeyInfo (DER) of the
+// live cert autocert currently serves for the primary domain, or nil
+// if autocert isn't active (dev plaintext mode) or the manager hasn't
+// minted a cert yet (cold start, before first TLS handshake). The
+// /gateway/attestation handler calls this per request so the response
+// always carries the up-to-date TLS pubkey alongside the stable
+// identity key bound into REPORTDATA.
+func currentAutocertSPKI(m *autocert.Manager, domains []string) []byte {
+	if m == nil || len(domains) == 0 {
+		return nil
+	}
+	// Synthetic ClientHelloInfo with just the SNI is enough to drive
+	// GetCertificate against the in-process cache. The call returns
+	// immediately when a cert is cached; only a cold start (first
+	// cert ever) would race a slow ACME issuance, and the
+	// attestation handler caller already times out the /verify fetch
+	// at the browser side. No further deadline plumbing required.
+	cert, err := m.GetCertificate(&tls.ClientHelloInfo{ServerName: domains[0]})
+	if err != nil || cert == nil || len(cert.Certificate) == 0 {
+		return nil
+	}
+	parsed, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return nil
+	}
+	return parsed.RawSubjectPublicKeyInfo
 }
 
 func validACMEToken(s string) bool {

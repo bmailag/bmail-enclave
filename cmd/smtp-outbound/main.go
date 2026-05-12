@@ -866,8 +866,6 @@ func run() error {
 	if healthPort == "" {
 		healthPort = "8093"
 	}
-	metrics := gateway.NewMetrics()
-
 	healthMux := http.NewServeMux()
 	healthMux.HandleFunc("GET /healthz", gateway.HealthHandler())
 
@@ -892,7 +890,6 @@ func run() error {
 		return nil
 	})
 	healthMux.HandleFunc("GET /readyz", rc.Handler())
-	healthMux.HandleFunc("GET /metrics", metrics.MetricsHandler())
 	// Attestation: SGX quote with REPORTDATA bound to the outbound TLS
 	// public key. The /verify page (via gateway proxy
 	// /.well-known/sgx-quotes/smtp-outbound) cross-checks against the

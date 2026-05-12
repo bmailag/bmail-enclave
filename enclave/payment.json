@@ -7,7 +7,9 @@
     "securityVersion": 1,
     "mounts": [
         {"source": "/opt/bmail/sealed", "target": "/opt/bmail/sealed", "type": "hostfs", "readOnly": false},
-        {"source": "/etc/ssl/certs", "target": "/etc/ssl/certs", "type": "hostfs", "readOnly": true}
+        {"source": "/opt/bmail/payment-snapshots", "target": "/opt/bmail/payment-snapshots", "type": "hostfs", "readOnly": false},
+        {"source": "/etc/ssl/certs", "target": "/etc/ssl/certs", "type": "hostfs", "readOnly": true},
+        {"source": "/etc/resolv.conf", "target": "/etc/resolv.conf", "type": "hostfs", "readOnly": true}
     ],
     "env": [
         {"name": "VP_ENV", "fromHost": true},
@@ -29,6 +31,14 @@
         {"name": "MONERO_WALLET_RPC_URL", "fromHost": true},
         {"name": "ETHEREUM_RPC_URL", "fromHost": true},
         {"name": "ETHEREUM_CONTRACT_ADDRESS", "fromHost": true},
-        {"name": "BATCH_SIGNING_INTERVAL", "fromHost": true}
+        {"name": "BATCH_SIGNING_INTERVAL", "fromHost": true},
+        {"name": "PAYMENT_SNAPSHOT_S3_ENDPOINT", "fromHost": true},
+        {"name": "PAYMENT_SNAPSHOT_S3_ACCESS_KEY", "fromHost": true},
+        {"name": "PAYMENT_SNAPSHOT_S3_SECRET_KEY", "fromHost": true},
+        {"name": "PAYMENT_SNAPSHOT_S3_BUCKET", "fromHost": true},
+        {"name": "PAYMENT_SNAPSHOT_S3_PREFIX", "fromHost": true},
+        {"name": "PAYMENT_SNAPSHOT_S3_INSECURE", "fromHost": true},
+        {"name": "PAYMENT_SNAPSHOT_LOCAL_DIR", "fromHost": true},
+        {"name": "PAYMENT_SNAPSHOT_FILES", "fromHost": true}
     ]
 }

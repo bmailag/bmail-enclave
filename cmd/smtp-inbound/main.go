@@ -349,8 +349,6 @@ func run() error {
 	if healthPort == "" {
 		healthPort = "8092"
 	}
-	metrics := gateway.NewMetrics()
-
 	healthMux := http.NewServeMux()
 	healthMux.HandleFunc("GET /healthz", gateway.HealthHandler())
 	rc := gateway.NewReadinessChecker()
@@ -362,7 +360,6 @@ func run() error {
 		return nil
 	})
 	healthMux.HandleFunc("GET /readyz", rc.Handler())
-	healthMux.HandleFunc("GET /metrics", metrics.MetricsHandler())
 	// Attestation: returns the SGX quote with REPORTDATA bound to the
 	// SMTP TLS public key. The /verify page on bmail.ag fetches this
 	// (proxied by the gateway as /.well-known/sgx-quotes/smtp-inbound)
