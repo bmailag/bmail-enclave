@@ -50,6 +50,15 @@ $(ENCLAVES):
 	  EXPECTED=$$(tr -d '[:space:]' < enclave/mrenclaves/$@.mrenclave) ; \
 	  if [ "$$MRE" = "$$EXPECTED" ]; then \
 	    echo "    $@: MRENCLAVE OK ($$MRE)" ; \
+	  elif [ "$@" = "keystore" ]; then \
+	    echo "    $@: MRENCLAVE DRIFT — DEFERRED (ADR-008)" ; \
+	    echo "      pinned (production-running, in release notes): $$EXPECTED" ; \
+	    echo "      built (this rebuild from current source):      $$MRE" ; \
+	    echo "      The keystore enclave seals state under MRENCLAVE-Unique," ; \
+	    echo "      so a freshly-built binary cannot unseal what the running" ; \
+	    echo "      one wrote. Production stays on the pinned MRENCLAVE until" ; \
+	    echo "      the export/import migration tool ships (see ADR-008 in" ; \
+	    echo "      bmail.git/docs/decisions/008-keystore-mrenclave-migration.md)." ; \
 	  else \
 	    echo "    $@: MRENCLAVE MISMATCH" ; \
 	    echo "      expected: $$EXPECTED" ; \

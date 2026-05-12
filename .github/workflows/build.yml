@@ -30,12 +30,28 @@ jobs:
       - name: Re-collect MRENCLAVE values for release notes
         id: mre
         run: |
-          # Regular variants (run on SGX1 hosts: fullxp, Box 1, Box 4)
-          for svc in gateway smtp-inbound smtp-outbound payment keystore; do
+          # Regular variants (run on SGX1 hosts: fullxp, Box 1, Box 4).
+          # For most enclaves we report the freshly-rebuilt MRENCLAVE
+          # because that's what a third party would get by repeating the
+          # build — and what the production enclaves are bound to.
+          #
+          # The keystore is special: production is pinned to the
+          # MRENCLAVE recorded in enclave/mrenclaves/keystore.mrenclave
+          # because its sealed state is MRENCLAVE-Unique-bound (ADR-008).
+          # The freshly-rebuilt MRENCLAVE drifts whenever any transitively-
+          # imported source changes. Reporting the pinned value here keeps
+          # /verify's "Public release" row in sync with the live keystore.
+          for svc in gateway smtp-inbound smtp-outbound payment; do
             mre=$(ego uniqueid build/${svc})
             echo "${svc}_mrenclave=${mre}" >> "$GITHUB_OUTPUT"
             echo "${svc}: ${mre}"
           done
+          keystore_pinned=$(tr -d '[:space:]' < enclave/mrenclaves/keystore.mrenclave)
+          keystore_built=$(ego uniqueid build/keystore)
+          echo "keystore_mrenclave=${keystore_pinned}" >> "$GITHUB_OUTPUT"
+          echo "keystore_built_mrenclave=${keystore_built}" >> "$GITHUB_OUTPUT"
+          echo "keystore (pinned, in release notes): ${keystore_pinned}"
+          echo "keystore (rebuilt from current source): ${keystore_built}"
           # Super variants (gateway + smtp-inbound run on the SGX2
           # super-server in production; same source, larger heap).
           # Output keys use underscores because GITHUB_OUTPUT values
@@ -92,8 +108,21 @@ jobs:
             smtp-inbound         ${{ steps.mre.outputs.smtp-inbound_mrenclave }}
             smtp-outbound        ${{ steps.mre.outputs.smtp-outbound_mrenclave }}
             payment              ${{ steps.mre.outputs.payment_mrenclave }}
-            keystore             ${{ steps.mre.outputs.keystore_mrenclave }}
+            keystore             ${{ steps.mre.outputs.keystore_mrenclave }}  (pinned — see note)
             ```
+
+            **Keystore note**: keystore is pinned to the MRENCLAVE that
+            the running production enclave was built against, NOT the
+            freshly-rebuilt value (which is
+            `${{ steps.mre.outputs.keystore_built_mrenclave }}`). The
+            keystore seals its audit log + allowlist + key store under
+            MRENCLAVE-Unique, so a new-MRENCLAVE binary cannot unseal
+            what the running one wrote. Until the migration tool
+            (export/import under attested mTLS) lands, the published
+            release notes report the pinned value so verify pages match
+            the live attestation. See
+            [ADR-008](https://github.com/bmailag/bmail/blob/master/docs/decisions/008-keystore-mrenclave-migration.md).
+
 
             Super variants (run on the SGX2 super-server in production
             with a 32 GB enclave heap; same source, larger heap):
