@@ -274,6 +274,7 @@ func run() error {
 		"/auth/keys":                  true,
 		"/auth/recipient-keys":        true,
 		"/auth/pgp-key":               true,
+		"/auth/entitlement-pubkey":    true,
 		"/auth/verify-backup-email":   true,
 		"/billing/webhook":            true,
 		"/affiliate/track":            true,
