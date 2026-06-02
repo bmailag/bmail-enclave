@@ -30,6 +30,13 @@ const (
 	limitMail     = 1000
 	limitBusiness = 5000
 
+	// Per-tenant (custom domain) aggregate daily send cap. Protects the
+	// shared outbound IP from a single tenant flooding (many mailboxes, or
+	// one compromised mailbox) even when each mailbox stays under its own
+	// per-user cap. Generous tripwire, not a tight cap; tune via
+	// WithTenantDailyCap. 0 = disabled.
+	tenantDailyCapDefault = 10000
+
 	// First 72h of a new free account: 5/day with 3 unique recipients.
 	// Anti-abuse layer — spammers can't economically scale fake accounts
 	// when each one is limited to 5 outbound for 3 days. After the window
@@ -53,10 +60,12 @@ type accountCounter struct {
 // RateLimiter provides per-user outbound rate limiting.
 // Uses Redis when available for multi-instance consistency, with in-memory fallback.
 type RateLimiter struct {
-	mu       sync.Mutex
-	counters map[uuid.UUID]*accountCounter
-	nowFunc  func() time.Time // injectable for testing
-	redisRL  *ratelimit.RedisRateLimiter
+	mu             sync.Mutex
+	counters       map[uuid.UUID]*accountCounter
+	tenantCounters map[uuid.UUID]*accountCounter // per-tenant aggregate (in-memory fallback)
+	tenantDailyCap int
+	nowFunc        func() time.Time // injectable for testing
+	redisRL        *ratelimit.RedisRateLimiter
 }
 
 // RateLimiterOption configures a RateLimiter.
@@ -70,13 +79,51 @@ func WithSMTPRedis(rl *ratelimit.RedisRateLimiter) RateLimiterOption {
 // NewRateLimiter creates a new RateLimiter.
 func NewRateLimiter(opts ...RateLimiterOption) *RateLimiter {
 	rl := &RateLimiter{
-		counters: make(map[uuid.UUID]*accountCounter),
-		nowFunc:  time.Now,
+		counters:       make(map[uuid.UUID]*accountCounter),
+		tenantCounters: make(map[uuid.UUID]*accountCounter),
+		tenantDailyCap: tenantDailyCapDefault,
+		nowFunc:        time.Now,
 	}
 	for _, opt := range opts {
 		opt(rl)
 	}
 	return rl
+}
+
+// WithTenantDailyCap overrides the per-tenant aggregate daily send cap.
+// 0 disables per-tenant limiting.
+func WithTenantDailyCap(n int) RateLimiterOption {
+	return func(r *RateLimiter) { r.tenantDailyCap = n }
+}
+
+// AllowTenant enforces the per-tenant aggregate daily send cap (custom-domain
+// shared-IP protection), independent of per-user limits. Returns true if
+// allowed. A zero/negative configured cap disables the check.
+func (rl *RateLimiter) AllowTenant(tenantID uuid.UUID) bool {
+	limit := rl.tenantDailyCap
+	if limit <= 0 {
+		return true
+	}
+	if rl.redisRL != nil {
+		return rl.redisRL.Allow("smtp:send:tenant:"+tenantID.String(), limit, 24*time.Hour)
+	}
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	now := rl.nowFunc()
+	ac, exists := rl.tenantCounters[tenantID]
+	if !exists {
+		ac = &accountCounter{windowEnd: now.Truncate(24 * time.Hour).Add(24 * time.Hour), createdAt: now}
+		rl.tenantCounters[tenantID] = ac
+	}
+	if now.After(ac.windowEnd) {
+		ac.count = 0
+		ac.windowEnd = now.Truncate(24 * time.Hour).Add(24 * time.Hour)
+	}
+	if ac.count >= limit {
+		return false
+	}
+	ac.count++
+	return true
 }
 
 // RegisterAccount registers a new account for new-account throttling.

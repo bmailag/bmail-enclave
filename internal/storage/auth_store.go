@@ -36,18 +36,18 @@ func StripPlusTag(address string) string {
 // Lifecycle account_status values. The CHECK constraint in migration
 // 094 enforces the same set at the DB level; keep these in sync.
 const (
-	StatusActive            = "active"
-	StatusPaymentFailed     = "payment_failed"
-	StatusLapsedToFree      = "lapsed_to_free"
-	StatusPruneWarned       = "prune_warned"
-	StatusPruning           = "pruning"
-	StatusTombstone         = "tombstone"
-	StatusDeletedTombstone  = "deleted_tombstone"
+	StatusActive           = "active"
+	StatusPaymentFailed    = "payment_failed"
+	StatusLapsedToFree     = "lapsed_to_free"
+	StatusPruneWarned      = "prune_warned"
+	StatusPruning          = "pruning"
+	StatusTombstone        = "tombstone"
+	StatusDeletedTombstone = "deleted_tombstone"
 	// Legacy values retained for back-compat — no new code should write
 	// these; the cleanup cron sweeps stale rows.
-	StatusPendingPayment = "pending_payment"
-	StatusSuspended      = "suspended"
-	StatusPurgePending   = "purge_pending"
+	StatusPendingPayment  = "pending_payment"
+	StatusSuspended       = "suspended"
+	StatusPurgePending    = "purge_pending"
 	StatusDeletionPending = "deletion_pending"
 )
 
@@ -230,6 +230,85 @@ func (s *AuthStore) RegisterInvitedUser(ctx context.Context, user *User, invitat
 }
 
 // GetUserByAddress looks up a user by their email address.
+// ResolveRecipient maps an inbound recipient address to the mailbox that should
+// receive it (ADR-010): an exact mailbox, then an alias's target, then the
+// domain's catch-all. Used by smtp-inbound for RCPT acceptance + delivery so
+// aliases/catch-all work transparently. Returns an error if nothing matches.
+func (s *AuthStore) ResolveRecipient(ctx context.Context, address string) (*User, error) {
+	address = strings.ToLower(strings.TrimSpace(address))
+	// 1. Exact mailbox.
+	if u, err := s.GetUserByAddress(ctx, address); err == nil {
+		return u, nil
+	}
+	// 2. Alias → target mailbox.
+	var targetID uuid.UUID
+	err := s.DB.Pool.QueryRow(ctx, `SELECT target_user_id FROM aliases WHERE address = $1`, address).Scan(&targetID)
+	if err == nil {
+		return s.GetUserByID(ctx, targetID)
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("resolve alias: %w", err)
+	}
+	// 3. Domain catch-all.
+	at := strings.LastIndexByte(address, '@')
+	if at < 0 {
+		return nil, fmt.Errorf("no such recipient: %s", address)
+	}
+	var catchAll *uuid.UUID
+	err = s.DB.Pool.QueryRow(ctx, `SELECT catch_all_user_id FROM tenants WHERE domain = $1`, address[at+1:]).Scan(&catchAll)
+	if err == nil && catchAll != nil {
+		return s.GetUserByID(ctx, *catchAll)
+	}
+	return nil, fmt.Errorf("no such recipient: %s", address)
+}
+
+// ResolveRecipientAddresses returns ALL target mailbox addresses an inbound
+// address delivers to (ADR-011): one for an exact mailbox / single alias /
+// catch-all, or many for a distribution group. Used by smtp-inbound to fan a
+// group address out to every member (each delivered + encrypted individually).
+func (s *AuthStore) ResolveRecipientAddresses(ctx context.Context, address string) ([]string, error) {
+	address = strings.ToLower(strings.TrimSpace(address))
+	// 1. Exact mailbox.
+	if _, err := s.GetUserByAddress(ctx, address); err == nil {
+		return []string{address}, nil
+	}
+	// 2. Alias / group → every target mailbox address.
+	rows, err := s.DB.Pool.Query(ctx,
+		`SELECT u.address FROM aliases a JOIN users u ON u.user_id = a.target_user_id WHERE a.address = $1`,
+		address)
+	if err != nil {
+		return nil, fmt.Errorf("resolve alias targets: %w", err)
+	}
+	var targets []string
+	for rows.Next() {
+		var addr string
+		if err := rows.Scan(&addr); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan alias target: %w", err)
+		}
+		targets = append(targets, addr)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(targets) > 0 {
+		return targets, nil
+	}
+	// 3. Domain catch-all.
+	at := strings.LastIndexByte(address, '@')
+	if at < 0 {
+		return nil, fmt.Errorf("no such recipient: %s", address)
+	}
+	var catchAll *uuid.UUID
+	if err := s.DB.Pool.QueryRow(ctx, `SELECT catch_all_user_id FROM tenants WHERE domain = $1`, address[at+1:]).Scan(&catchAll); err == nil && catchAll != nil {
+		if u, uerr := s.GetUserByID(ctx, *catchAll); uerr == nil {
+			return []string{u.Address}, nil
+		}
+	}
+	return nil, fmt.Errorf("no such recipient: %s", address)
+}
+
 func (s *AuthStore) GetUserByAddress(ctx context.Context, address string) (*User, error) {
 	address = strings.ToLower(StripPlusTag(address))
 	u := &User{}
@@ -408,8 +487,8 @@ func (s *AuthStore) ExtendFakeIDAllowedRelease(ctx context.Context, userID uuid.
 // enclave's HMAC tag derivation, and the minted_at to preserve the
 // original consumed_at timestamp.
 type FakeIDPrimaryRow struct {
-	UserID    uuid.UUID
-	MintedAt  time.Time
+	UserID   uuid.UUID
+	MintedAt time.Time
 }
 
 // ListUnmigratedFakeIDPrimaries returns primaries with has_fakeid = TRUE
@@ -762,6 +841,19 @@ func (s *AuthStore) UpdateSessionRefreshAndToken(ctx context.Context, sessionID 
 	return nil
 }
 
+// DomainTaken reports whether a tenant already exists for the given domain
+// (ADR-013: an org-first signup must not claim an already-existing tenant).
+func (s *AuthStore) DomainTaken(ctx context.Context, domain string) (bool, error) {
+	var exists bool
+	err := s.DB.Pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM tenants WHERE domain = $1)`, domain,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check domain taken: %w", err)
+	}
+	return exists, nil
+}
+
 // EnsureTenant gets or creates a tenant for the given domain, returning its ID.
 func (s *AuthStore) EnsureTenant(ctx context.Context, domain string) (uuid.UUID, error) {
 	var tenantID uuid.UUID
@@ -968,6 +1060,21 @@ func (s *AuthStore) UpdateUserTier(ctx context.Context, userID uuid.UUID, tier s
 		return fmt.Errorf("user not found: %s", userID)
 	}
 	return nil
+}
+
+// GetTenantTier returns a tenant's tier (defaults to "mail" if NULL). Used so
+// invited custom-domain members inherit the domain's tier (send limits /
+// storage base) instead of the DB-default "free".
+func (s *AuthStore) GetTenantTier(ctx context.Context, tenantID uuid.UUID) (string, error) {
+	var tier string
+	err := s.DB.Pool.QueryRow(ctx,
+		`SELECT COALESCE(tier, 'mail') FROM tenants WHERE tenant_id = $1`,
+		tenantID,
+	).Scan(&tier)
+	if err != nil {
+		return "", fmt.Errorf("get tenant tier: %w", err)
+	}
+	return tier, nil
 }
 
 // IsWelcomeDismissed returns true if the user has already seen (or
@@ -1738,12 +1845,12 @@ func (s *AuthStore) CancelDeletion(ctx context.Context, userID uuid.UUID) error 
 //
 // Routes:
 //   - 'tombstone'         — lifecycle dormancy hit; wipe immediately
-//                           (the lifecycle cron only flips to this
-//                           after 365d of inactivity + warnings).
+//     (the lifecycle cron only flips to this
+//     after 365d of inactivity + warnings).
 //   - 'deleted_tombstone' — user-initiated delete, 30d grace from
-//                           deletion_requested_at then wipe.
+//     deletion_requested_at then wipe.
 //   - 'deletion_pending'  — legacy alias of deleted_tombstone, 14d
-//                           grace (kept for back-compat).
+//     grace (kept for back-compat).
 //   - 'purge_pending'     — legacy stale-pending_payment sweep.
 func (s *AuthStore) GetDeletionPendingUsers(ctx context.Context, olderThan time.Time) ([]User, error) {
 	rows, err := s.DB.Pool.Query(ctx,
@@ -1815,6 +1922,73 @@ func (s *AuthStore) PurgeUser(ctx context.Context, userID, tenantID uuid.UUID) e
 	return tx.Commit(ctx)
 }
 
+// PurgeTenant permanently deletes a tenant and everything under it: all member
+// users (via PurgeUser, which clears each user's owned rows + CASCADE children),
+// the FK-less kt_leaves rows scoped to the tenant, and finally the tenant row
+// itself — whose ON DELETE CASCADE clears tenant_roles, billing_credits,
+// domain_verifications, domain_invitations, aliases, and the group tables.
+//
+// It is used to (a) reclaim a squatted-but-unverified domain once the rightful
+// owner proves DNS control, and (b) GC abandoned unverified tenants. CALLERS
+// MUST gate this on tenant.Verified == false — a verified, paid org must never
+// be purged this way. Not wrapped in a single transaction (PurgeUser opens its
+// own); a partial failure leaves a half-purged tenant that a re-run completes.
+func (s *AuthStore) PurgeTenant(ctx context.Context, tenantID uuid.UUID) error {
+	// Break the tenant -> owner self-reference (owner_user_id has no ON DELETE
+	// rule) and the catch-all ref so the member users can be deleted.
+	if _, err := s.DB.Pool.Exec(ctx,
+		`UPDATE tenants SET owner_user_id = NULL, catch_all_user_id = NULL WHERE tenant_id = $1`,
+		tenantID,
+	); err != nil {
+		return fmt.Errorf("clear tenant owner refs: %w", err)
+	}
+
+	users, err := s.ListUsersByTenant(ctx, tenantID)
+	if err != nil {
+		return fmt.Errorf("list tenant users: %w", err)
+	}
+	for _, u := range users {
+		if err := s.PurgeUser(ctx, u.UserID, tenantID); err != nil {
+			return fmt.Errorf("purge user %s: %w", u.UserID, err)
+		}
+	}
+
+	// kt_leaves has no FK to tenants; remove the tenant's leaves explicitly.
+	if _, err := s.DB.Pool.Exec(ctx, `DELETE FROM kt_leaves WHERE tenant_id = $1`, tenantID); err != nil {
+		return fmt.Errorf("delete kt leaves: %w", err)
+	}
+
+	if _, err := s.DB.Pool.Exec(ctx, `DELETE FROM tenants WHERE tenant_id = $1`, tenantID); err != nil {
+		return fmt.Errorf("delete tenant: %w", err)
+	}
+	return nil
+}
+
+// ListStaleUnverifiedTenants returns custom-domain tenants (owner_user_id set)
+// that have never had their domain ownership verified and were created before
+// the cutoff. Used by the GC sweep to reap abandoned squats. Operator/default
+// domains (owner_user_id NULL) are never returned.
+func (s *AuthStore) ListStaleUnverifiedTenants(ctx context.Context, createdBefore time.Time) ([]uuid.UUID, error) {
+	rows, err := s.DB.Pool.Query(ctx,
+		`SELECT tenant_id FROM tenants
+		 WHERE owner_user_id IS NOT NULL AND verified = false AND created_at < $1`,
+		createdBefore,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list stale unverified tenants: %w", err)
+	}
+	defer rows.Close()
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan tenant id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // TombstoneUser wipes all user data while preserving the row + auth
 // records, so the address never returns to the signup pool but the
 // rightful owner can reclaim it via password / mnemonic / backup
@@ -1823,17 +1997,19 @@ func (s *AuthStore) PurgeUser(ctx context.Context, userID, tenantID uuid.UUID) e
 // (user-initiated delete after 30d grace) state.
 //
 // Wiped:    messages, folders (+ blob refs), sessions, public keys,
-//           encrypted private keys, KEM keys, PGP key, TOTP secrets,
-//           Stripe identifiers, payment_failed_at, storage counters,
-//           fakeid sentinels. CASCADE handles attachments, contacts,
-//           api_tokens, labels, rules, blocked_senders,
-//           push_subscriptions, calendar/drive rows the user owned.
+//
+//	encrypted private keys, KEM keys, PGP key, TOTP secrets,
+//	Stripe identifiers, payment_failed_at, storage counters,
+//	fakeid sentinels. CASCADE handles attachments, contacts,
+//	api_tokens, labels, rules, blocked_senders,
+//	push_subscriptions, calendar/drive rows the user owned.
 //
 // Preserved: user_id, tenant_id, address, account_status,
-//            tombstoned_at (created_at retained), opaque_registration
-//            (password login), opaque_recovery_registration (mnemonic
-//            login), recovery_blob, key_epoch, account_type. Backup
-//            email lives on user_settings and is retained too.
+//
+//	tombstoned_at (created_at retained), opaque_registration
+//	(password login), opaque_recovery_registration (mnemonic
+//	login), recovery_blob, key_epoch, account_type. Backup
+//	email lives on user_settings and is retained too.
 //
 // Idempotent: re-running on an already-tombstoned row is a no-op.
 func (s *AuthStore) TombstoneUser(ctx context.Context, userID, tenantID uuid.UUID) error {

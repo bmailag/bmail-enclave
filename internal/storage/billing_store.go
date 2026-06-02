@@ -146,6 +146,38 @@ func (s *BillingStore) GetActiveMailboxQuota(ctx context.Context, tenantID uuid.
 	return total, nil
 }
 
+// UpdateActiveMailboxQuota re-syncs the active PAID billing credit's
+// mailbox_quota for a tenant to `quota` (ADR-010 seat-change, Stripe-as-truth).
+// Scoped to non-comped credits so admin comps aren't clobbered; under the
+// normal one-active-paid-credit-per-period model this sets exactly that credit.
+func (s *BillingStore) UpdateActiveMailboxQuota(ctx context.Context, tenantID uuid.UUID, quota int) error {
+	_, err := s.DB.Pool.Exec(ctx,
+		`UPDATE billing_credits SET mailbox_quota = $2
+		 WHERE tenant_id = $1 AND valid_from <= now() AND valid_until > now()
+		   AND comped_by_user_id IS NULL`,
+		tenantID, quota,
+	)
+	if err != nil {
+		return fmt.Errorf("update active mailbox quota: %w", err)
+	}
+	return nil
+}
+
+// SumTenantStorageBlocks totals users.storage_blocks across a tenant's users
+// (ADR-010 domain-wide storage: the owner's subscription storage line equals
+// this sum).
+func (s *BillingStore) SumTenantStorageBlocks(ctx context.Context, tenantID uuid.UUID) (int, error) {
+	var total int
+	err := s.DB.Pool.QueryRow(ctx,
+		`SELECT COALESCE(SUM(storage_blocks), 0) FROM users WHERE tenant_id = $1`,
+		tenantID,
+	).Scan(&total)
+	if err != nil {
+		return 0, fmt.Errorf("sum tenant storage blocks: %w", err)
+	}
+	return total, nil
+}
+
 // GetActiveCredits returns all active billing credits for a tenant.
 func (s *BillingStore) GetActiveCredits(ctx context.Context, tenantID uuid.UUID) ([]BillingCredit, error) {
 	rows, err := s.DB.Pool.Query(ctx,

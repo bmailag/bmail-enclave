@@ -49,6 +49,7 @@ type Pipeline struct {
 	contactsStore  *storage.ContactsStore
 	ruleStore      *storage.RuleStore
 	mailStore      *storage.MailStore
+	groupStore     *storage.GroupStore // optional: E2E private group delivery (ADR-012)
 	folderStore    *storage.FolderStore
 	labelStore     *storage.LabelStore
 	autoReplyStore *storage.AutoReplyStore
@@ -101,6 +102,12 @@ func (p *Pipeline) SetPostReceiveStores(
 	p.labelStore = labelStore
 	p.autoReplyStore = autoReplyStore
 	p.autoReplyDedup = autoReplyDedup
+}
+
+// SetGroupStore attaches the group store, enabling E2E private group delivery
+// (ADR-012). When nil, group addresses simply never resolve (no group delivery).
+func (p *Pipeline) SetGroupStore(gs *storage.GroupStore) {
+	p.groupStore = gs
 }
 
 // SetTLSActive marks whether the SMTP server has TLS configured.
@@ -172,6 +179,11 @@ type InboundMessage struct {
 
 	TenantID            string               `json:"tenant_id"`
 	UserID              string               `json:"user_id"`
+	// Group delivery (ADR-012): when GroupID is set, this message was encrypted
+	// to the group's shared key and is being fanned out to a member's mailbox.
+	// GroupKeyEpoch is the group's key_epoch (stored in messages.key_epoch).
+	GroupID             string               `json:"group_id,omitempty"`
+	GroupKeyEpoch       int                  `json:"group_key_epoch,omitempty"`
 	EphemeralPubkey     []byte               `json:"ephemeral_pubkey"`
 	EncryptedMessageKey []byte               `json:"encrypted_message_key"`
 	EncryptedBody       []byte               `json:"encrypted_body"`
@@ -342,8 +354,8 @@ func (p *Pipeline) ProcessMessage(ctx context.Context, from string, to string, r
 	isPGP := crypto.DetectPGPMIME(rawMessage) || crypto.DetectPGPInline(body)
 	isSMIME := crypto.DetectSMIME(rawMessage)
 
-	// 4. Look up recipient's public key.
-	user, err := p.authStore.GetUserByAddress(ctx, to)
+	// 4. Resolve recipient (exact / alias / catch-all) + look up their key.
+	user, err := p.authStore.ResolveRecipient(ctx, to)
 	if err != nil {
 		return fmt.Errorf("lookup recipient: %w", err)
 	}
@@ -544,6 +556,247 @@ func (p *Pipeline) ProcessMessage(ctx context.Context, from string, to string, r
 
 	slog.Info("message processed", "folder", folderAssignment, "spf", spfResult, "dkim", dkimResult, "dmarc", dmarcResult, "spam_score", spamScore, "encryption", encryptionType)
 	return nil
+}
+
+// ProcessGroupMessage delivers an inbound message addressed to an E2E private
+// group (ADR-012). Unlike ProcessMessage (which encrypts to a single user's
+// key), this encrypts the message ONCE to the group's shared public key and
+// fans the identical ciphertext into each member's mailbox, marked with the
+// group_id + group key_epoch. The server never holds the group private key, so
+// it cannot read the mail. Per-member rules/block/auto-reply are intentionally
+// skipped (the cleartext is identical for all members; group mail lands in
+// inbox), and members are filtered by joined_at_epoch so no one sees pre-join
+// history.
+//
+// directRecipients are addresses that already received this message directly
+// in the same delivery (To/Cc RCPTs). They — and the sender — are skipped in
+// the fan-out so nobody gets the same message twice (the Gmail ingestion-dedup
+// model: your own post to a group is represented by your Sent copy, and a
+// direct copy beats a list copy).
+func (p *Pipeline) ProcessGroupMessage(ctx context.Context, from string, group *storage.Group, rawMessage []byte, clientIP net.IP, helo string, directRecipients ...string) error {
+	defer crypto.ZeroBytes(rawMessage)
+	if p.groupStore == nil {
+		return fmt.Errorf("group delivery not configured")
+	}
+
+	parsed, err := parseMessageFull(rawMessage)
+	if err != nil {
+		return fmt.Errorf("parse message: %w", err)
+	}
+	subject := parsed.Subject
+	body := parsed.Body
+	defer crypto.ZeroBytes([]byte(subject))
+	defer crypto.ZeroBytes(body)
+
+	spfResult, dkimResult, dmarcResult := runSecurityChecks(ctx, from, clientIP, rawMessage, helo)
+
+	folderAssignment := "inbox"
+	var spamScore float64
+	if p.spamFilter != nil {
+		headers := parsed.Headers
+		if headers == nil {
+			headers = make(map[string][]string)
+		}
+		sr := p.spamFilter.CheckMessage(ctx, clientIP, helo, from, headers, body, spfResult, dkimResult, dmarcResult)
+		spamScore = sr.Score
+		folderAssignment = sr.FolderAssignment
+	}
+	if dmarcResult == "reject" {
+		folderAssignment = "junk"
+	}
+
+	// Mailing-list headers (RFC 2919 List-Id, RFC 2369 List-Post, plus Reply-To
+	// when the sender didn't set one): stamped AFTER SPF/DKIM/spam ran on the
+	// original bytes — so verification covers what the sender actually signed —
+	// and BEFORE encryption, so both the encrypted header map (bmail clients)
+	// and the raw blob (external clients reading an exported .eml) carry them.
+	// This is what makes "reply" go to the group everywhere, not just in our
+	// own client.
+	if parsed.Headers == nil {
+		parsed.Headers = make(map[string][]string)
+	}
+	if stamped, changed := stampGroupListHeaders(parsed.Headers, rawMessage, group.Address); changed {
+		rawMessage = stamped
+		defer crypto.ZeroBytes(stamped)
+	}
+
+	// Encrypt to the GROUP public key (hybrid X25519 + ML-KEM-768).
+	groupPub, err := ecdh.X25519().NewPublicKey(group.PublicKeyX25519)
+	if err != nil {
+		return fmt.Errorf("parse group public key: %w", err)
+	}
+	var kemEK *mlkem.EncapsulationKey768
+	if len(group.PublicKeyKEM) > 0 {
+		kemEK, err = crypto.MLKEMEncapsulationKeyFromBytes(group.PublicKeyKEM)
+		if err != nil {
+			slog.Warn("parse group KEM pubkey failed, falling back to classical", "group_id", group.GroupID, "error", err)
+			kemEK = nil
+		}
+	}
+
+	rawMeta := buildRawMeta(rawMessage)
+	encryptedRaw, err := crypto.EncryptRawMessageWithMetaHybrid(groupPub, kemEK, rawMessage, rawMeta, crypto.DefaultChunkSize)
+	if err != nil {
+		return fmt.Errorf("encrypt raw message: %w", err)
+	}
+	rawBlobFormat := crypto.RawBlobFormatChunked(crypto.DefaultChunkSize)
+
+	headersJSON, hdrErr := storage.MarshalMessageHeaders(parsed.Headers)
+	if hdrErr != nil {
+		return fmt.Errorf("marshal headers: %w", hdrErr)
+	}
+	encrypted, err := crypto.EncryptMessageWithHeadersHybrid(groupPub, kemEK, []byte(subject), body, headersJSON)
+	if err != nil {
+		return fmt.Errorf("encrypt message: %w", err)
+	}
+
+	var encryptedAtts []EncryptedInboundAttachment
+	for i := range parsed.Attachments {
+		att := &parsed.Attachments[i]
+		metadataJSON := fmt.Sprintf(`{"filename":%q,"content_type":%q,"content_id":%q}`, att.Filename, att.ContentType, att.ContentID)
+		sizeBytes := int64(len(att.Data))
+		encAtt, encErr := crypto.EncryptMessageHybrid(groupPub, kemEK, []byte(metadataJSON), att.Data)
+		if encErr != nil {
+			return fmt.Errorf("encrypt attachment %q: %w", att.Filename, encErr)
+		}
+		crypto.ZeroBytes(att.Data)
+		att.Data = nil
+		encryptedAtts = append(encryptedAtts, EncryptedInboundAttachment{
+			EphemeralPubkey:   encAtt.EphemeralPubkey,
+			EncryptedKey:      encAtt.EncryptedMessageKey,
+			EncryptedData:     encAtt.EncryptedBody,
+			EncryptedMetadata: encAtt.EncryptedSubject,
+			SizeBytes:         sizeBytes,
+		})
+	}
+
+	receiptJSON, err := buildEnclaveReceipt(p, rawMessage, encrypted, from, spfResult, dkimResult, dmarcResult, spamScore, folderAssignment)
+	if err != nil {
+		return err
+	}
+
+	members, err := p.groupStore.ListMembers(ctx, group.GroupID)
+	if err != nil {
+		return fmt.Errorf("list group members: %w", err)
+	}
+
+	// Ingestion dedup: resolve the sender and any direct To/Cc recipients of
+	// this same delivery to user IDs; those members are skipped in the fan-out
+	// so nobody stores the same message twice. The sender's record of their own
+	// post is their Sent copy; a direct copy supersedes a list copy.
+	skipMember := make(map[uuid.UUID]bool, len(directRecipients)+1)
+	for _, addr := range append([]string{from}, directRecipients...) {
+		if strings.TrimSpace(addr) == "" {
+			continue
+		}
+		if u, uerr := p.authStore.GetUserByAddress(ctx, addr); uerr == nil && u != nil {
+			skipMember[u.UserID] = true
+		}
+	}
+
+	// Serialize the shared encrypted payload once; reuse for every member.
+	base := InboundMessage{
+		GroupID:             group.GroupID.String(),
+		GroupKeyEpoch:       group.KeyEpoch,
+		EphemeralPubkey:     encrypted.EphemeralPubkey,
+		EncryptedMessageKey: encrypted.EncryptedMessageKey,
+		EncryptedBody:       encrypted.EncryptedBody,
+		EncryptedSubject:    encrypted.EncryptedSubject,
+		EncryptedHeaders:    encrypted.EncryptedHeaders,
+		SPFResult:           spfResult,
+		DKIMResult:          dkimResult,
+		DMARCResult:         dmarcResult,
+		Receipt:             receiptJSON,
+		FolderAssignment:    folderAssignment,
+		ReceivedAt:          time.Now().UTC(),
+		InReplyTo:           parsed.InReplyTo,
+		References:          parsed.References,
+		MessageID:           parsed.MessageID,
+		EncryptionType:      "received",
+		EncryptedAttachments: encryptedAtts,
+		EncryptedRawBody:     encryptedRaw.EncryptedBody,
+		EncryptedRawKey:      encryptedRaw.EncryptedMessageKey,
+		RawEphemeralPubkey:   encryptedRaw.EphemeralPubkey,
+		RawBlobFormat:        rawBlobFormat,
+		EncryptedRawMeta:     encryptedRaw.EncryptedMeta,
+	}
+
+	tenant := group.TenantID.String()
+	natsSubject := fmt.Sprintf("mail.inbound.%s", tenant)
+	var delivered, skipped int
+	for _, m := range members {
+		// joined_at_epoch filter: a member only receives mail from epochs at or
+		// after they joined (no pre-join history). Current members satisfy this.
+		if m.JoinedAtEpoch > group.KeyEpoch {
+			continue
+		}
+		// Ingestion dedup (see skipMember above).
+		if skipMember[m.MemberUserID] {
+			skipped++
+			continue
+		}
+		msg := base // shallow copy; byte slices are shared (read-only after this point)
+		msg.TenantID = tenant
+		msg.UserID = m.MemberUserID.String()
+		data, mErr := json.Marshal(msg)
+		if mErr != nil {
+			slog.Error("marshal group inbound message", "group_id", group.GroupID, "member", m.MemberUserID, "error", mErr)
+			continue
+		}
+		if pErr := p.queue.Publish(ctx, natsSubject, data); pErr != nil {
+			slog.Error("publish group message", "group_id", group.GroupID, "member", m.MemberUserID, "error", pErr)
+			continue
+		}
+		delivered++
+	}
+
+	slog.Info("group message processed", "group_id", group.GroupID, "members", len(members), "delivered", delivered, "skipped", skipped, "spf", spfResult, "dkim", dkimResult, "dmarc", dmarcResult)
+	// delivered == 0 is only an error when nobody was deliberately skipped —
+	// e.g. the sender posting to a group where they're the sole member is fine
+	// (their Sent copy IS the delivery).
+	if delivered == 0 && skipped == 0 {
+		return fmt.Errorf("group %s: no members received the message", group.GroupID)
+	}
+	return nil
+}
+
+// stampGroupListHeaders adds mailing-list headers to a group fan-out: List-Id
+// (RFC 2919), List-Post (RFC 2369), and Reply-To — the latter only when the
+// sender didn't set their own, so an explicit sender Reply-To still wins.
+//
+// The headers go in two places: the parsed header map (which becomes the
+// E2E-encrypted header blob bmail clients read) and PREPENDED to the raw
+// message bytes (which external clients see when the raw .eml is exported).
+// Prepending leaves every original header and the body byte-identical, so the
+// sender's DKIM signature over its signed fields stays verifiable.
+//
+// Returns the (possibly new) raw bytes and whether anything was added.
+func stampGroupListHeaders(headers map[string][]string, rawMessage []byte, groupAddress string) ([]byte, bool) {
+	var added []string
+
+	if len(headers["Reply-To"]) == 0 {
+		headers["Reply-To"] = []string{groupAddress}
+		added = append(added, "Reply-To: "+groupAddress)
+	}
+
+	// List-Id (RFC 2919): the group address with '@' folded to '.', in angle
+	// brackets — e.g. <team.example.com>.
+	listID := "<" + strings.Replace(groupAddress, "@", ".", 1) + ">"
+	headers["List-Id"] = []string{listID}
+	added = append(added, "List-Id: "+listID)
+
+	listPost := "<mailto:" + groupAddress + ">"
+	headers["List-Post"] = []string{listPost}
+	added = append(added, "List-Post: "+listPost)
+
+	var b bytes.Buffer
+	b.Grow(len(rawMessage) + 160)
+	for _, h := range added {
+		b.WriteString(h)
+		b.WriteString("\r\n")
+	}
+	b.Write(rawMessage)
+	return b.Bytes(), true
 }
 
 // parsedMessage holds the result of parsing a raw RFC 5322 message.

@@ -39,13 +39,13 @@ func (s *MailStore) InsertMessage(ctx context.Context, msg *Message) error {
 			encrypted_subject, encrypted_message_key, ephemeral_pubkey,
 			received_at, size_bytes, has_attachments, is_read, key_epoch,
 			enclave_receipt, in_reply_to, "references", thread_id, encryption_type, subject, rfc_message_id, raw_blob_ref, raw_blob_format, encrypted_raw_meta,
-			sender_blind_index, encrypted_headers, is_starred)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)`,
+			sender_blind_index, encrypted_headers, is_starred, group_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)`,
 		msg.MessageID, msg.UserID, msg.TenantID, msg.FolderID, msg.BlobRef,
 		msg.EncryptedSubject, msg.EncryptedMessageKey, msg.EphemeralPubkey,
 		msg.ReceivedAt, msg.SizeBytes, msg.HasAttachments, msg.IsRead, msg.KeyEpoch,
 		msg.EnclaveReceipt, msg.InReplyTo, msg.References, msg.ThreadID, encType, msg.Subject, msg.RFCMessageID, msg.RawBlobRef, msg.RawBlobFormat, msg.EncryptedRawMeta,
-		msg.SenderBlindIndex, msg.EncryptedHeaders, msg.IsStarred,
+		msg.SenderBlindIndex, msg.EncryptedHeaders, msg.IsStarred, msg.GroupID,
 	)
 	if err != nil {
 		return fmt.Errorf("insert message: %w", err)
@@ -78,7 +78,8 @@ const messageColumns = `message_id, user_id, tenant_id, folder_id, blob_ref,
 	received_at, size_bytes, has_attachments, is_read, key_epoch,
 	enclave_receipt, in_reply_to, "references", thread_id, COALESCE(encryption_type, 'bmail'), is_starred, subject, rfc_message_id, raw_blob_ref, COALESCE(raw_blob_format, 'XChaCha20-Poly1305'), encrypted_raw_meta,
 	COALESCE(sender_blind_index, ''),
-	COALESCE(encrypted_headers, ''::bytea)`
+	COALESCE(encrypted_headers, ''::bytea),
+	group_id`
 
 // qualifiedMessageColumns returns the column list with a table alias prefix.
 func qualifiedMessageColumns(alias string) string {
@@ -87,7 +88,8 @@ func qualifiedMessageColumns(alias string) string {
 	%[1]s.received_at, %[1]s.size_bytes, %[1]s.has_attachments, %[1]s.is_read, %[1]s.key_epoch,
 	%[1]s.enclave_receipt, %[1]s.in_reply_to, %[1]s."references", %[1]s.thread_id, COALESCE(%[1]s.encryption_type, 'bmail'), %[1]s.is_starred, %[1]s.subject, %[1]s.rfc_message_id, %[1]s.raw_blob_ref, COALESCE(%[1]s.raw_blob_format, 'XChaCha20-Poly1305'), %[1]s.encrypted_raw_meta,
 	COALESCE(%[1]s.sender_blind_index, ''),
-	COALESCE(%[1]s.encrypted_headers, ''::bytea)`, alias)
+	COALESCE(%[1]s.encrypted_headers, ''::bytea),
+	%[1]s.group_id`, alias)
 }
 
 // scannable is satisfied by both pgx.Row and pgx.Rows.
@@ -104,6 +106,7 @@ func scanMessage(row scannable) (*Message, error) {
 		&m.EnclaveReceipt, &m.InReplyTo, &m.References, &m.ThreadID, &m.EncryptionType, &m.IsStarred, &m.Subject,
 		&m.RFCMessageID, &m.RawBlobRef, &m.RawBlobFormat, &m.EncryptedRawMeta,
 		&m.SenderBlindIndex, &m.EncryptedHeaders,
+		&m.GroupID,
 	)
 	return m, err
 }
@@ -223,6 +226,23 @@ func (s *MailStore) GetMessageByRFCMessageID(ctx context.Context, tenantID uuid.
 		return nil, fmt.Errorf("get message by rfc_message_id: %w", err)
 	}
 	return m, nil
+}
+
+// HasMessageWithRFCMessageID reports whether the user already holds ANY copy of
+// the message with this RFC 5322 Message-ID — their Sent copy or a previously
+// delivered inbound copy. Used for Gmail-style ingestion dedup: when the same
+// logical message arrives again (a mailing-list echo of the user's own post, or
+// a list copy after a direct To/Cc copy), the second copy is not stored.
+func (s *MailStore) HasMessageWithRFCMessageID(ctx context.Context, userID uuid.UUID, rfcMessageID string) (bool, error) {
+	var exists bool
+	err := s.DB.Pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM messages WHERE user_id = $1 AND rfc_message_id = $2)`,
+		userID, rfcMessageID,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check rfc_message_id dedup: %w", err)
+	}
+	return exists, nil
 }
 
 // UpdateThreadID sets the thread_id on an existing message. Used to backfill

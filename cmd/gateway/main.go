@@ -249,6 +249,11 @@ func run() error {
 		"/fakeid/auth/register/finish":  true,
 		"/fakeid/auth/recover/start":    true,
 		"/fakeid/auth/recover/finish":   true,
+		// Org-first custom-domain signup (ADR-013) — rate-limit the unauthenticated
+		// start (creates a Stripe session + reserves a domain) against abuse.
+		"/auth/org/start":               true,
+		"/auth/org/register/start":      true,
+		"/auth/org/register/finish":     true,
 	}
 
 	// Public API paths that don't require credentials (backend-facing).
@@ -262,6 +267,10 @@ func run() error {
 		"/auth/register/finish":     true,
 		"/auth/register/invite/start":  true,
 		"/auth/register/invite/finish": true,
+		// Org-first custom-domain signup (ADR-013): all three are pre-account.
+		"/auth/org/start":            true,
+		"/auth/org/register/start":   true,
+		"/auth/org/register/finish":  true,
 		"/auth/recover/start":         true,
 		"/auth/recover/finish":        true,
 		"/auth/recover/email":         true,

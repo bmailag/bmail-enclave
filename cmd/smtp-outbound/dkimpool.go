@@ -146,6 +146,37 @@ func fetchPoolEntry(ctx context.Context, cli *keystore.Client, selector string) 
 // Two TXTs go up per selector (one Ed25519 + one RSA) using
 // ModeReplace + ModeAdd so we sweep any stale entries on the first
 // call but preserve our own second call.
+// txtAlreadyLive reports whether every value in want is already present
+// as a live TXT record at host. Used to make pool publication idempotent
+// so a restart doesn't churn a fresh (grace-expiring) row when nothing
+// changed. Returns false on any lookup error or NXDOMAIN — i.e. "publish
+// when unsure", so a genuinely-missing record always gets published.
+func txtAlreadyLive(ctx context.Context, host string, want []string) bool {
+	lctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	got, err := net.DefaultResolver.LookupTXT(lctx, host)
+	if err != nil || len(got) == 0 {
+		return false
+	}
+	// Exact-set match, not just containment: a stale extra record (e.g. the
+	// retired ed25519 pool TXT) must trigger a republish, because the republish
+	// uses ModeReplace and is what prunes it. Containment alone would skip
+	// forever and the stale record would never go away.
+	if len(got) != len(want) {
+		return false
+	}
+	have := make(map[string]bool, len(got))
+	for _, g := range got {
+		have[g] = true
+	}
+	for _, w := range want {
+		if !have[w] {
+			return false
+		}
+	}
+	return true
+}
+
 func publishDKIMPoolTXTs(ctx context.Context, w dkimPoolWiring, runtime tee.TEERuntime) {
 	if w.client == nil {
 		return
@@ -168,6 +199,35 @@ func publishDKIMPoolTXTs(ctx context.Context, w dkimPoolWiring, runtime tee.TEER
 			continue
 		}
 		records := entry.DKIMPoolDNSRecords(zone)
+		// RSA-only on the wire: two key types under ONE selector make DKIM
+		// verification undefined (RFC 6376 §3.6.2.2) — verifiers pick an
+		// arbitrary TXT record, so RSA signatures randomly failed against the
+		// ed25519 key and custom-domain mail got junked. The pool signs RSA
+		// only (see internal/smtp/sender.go), so only the RSA key is published;
+		// the ModeReplace below prunes any previously-published ed25519 TXT.
+		rsaOnly := records[:0]
+		for _, r := range records {
+			if r.Algorithm == "rsa" {
+				rsaOnly = append(rsaOnly, r)
+			}
+		}
+		records = rsaOnly
+		// Idempotency guard: skip publishing when the correct TXTs are
+		// already live. KLB's enclaveUpdate "replace" doesn't hard-delete
+		// superseded rows — it grace-expires them — so re-publishing on
+		// every restart leaves a new graced row each time and they pile
+		// up indefinitely (the pool host had 292 stale rows before this).
+		// In steady state (key unchanged) we now publish zero new rows.
+		if len(records) > 0 {
+			want := make([]string, len(records))
+			for i, r := range records {
+				want[i] = r.Value
+			}
+			if txtAlreadyLive(ctx, records[0].Name, want) {
+				slog.Info("dkim pool TXTs already live, skipping publish", "selector", sel, "host", records[0].Name)
+				continue
+			}
+		}
 		for i, r := range records {
 			mode := dnsattest.ModeAdd
 			if i == 0 {

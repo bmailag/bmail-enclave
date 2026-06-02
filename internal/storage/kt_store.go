@@ -65,6 +65,23 @@ func (s *KTStore) NextEpoch(ctx context.Context, tenantID uuid.UUID) int64 {
 	return latest + 1
 }
 
+// AddOrUpdateLeaf inserts a leaf, or updates pubkey_hash if one already exists
+// for (user_id, epoch). Safe ONLY for the pending (not-yet-signed) epoch — that
+// epoch has no signed root yet, so revising a leaf before AdvanceEpoch commits
+// it is sound. Used for group key publication, where a group can be created and
+// then re-keyed (rotated) within a single KT epoch.
+func (s *KTStore) AddOrUpdateLeaf(ctx context.Context, userID, tenantID uuid.UUID, epoch int64, pubkeyHash []byte) error {
+	_, err := s.db.Pool.Exec(ctx,
+		`INSERT INTO kt_leaves (user_id, tenant_id, epoch, pubkey_hash) VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (user_id, epoch) DO UPDATE SET pubkey_hash = EXCLUDED.pubkey_hash`,
+		userID, tenantID, epoch, pubkeyHash,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert kt_leaf: %w", err)
+	}
+	return nil
+}
+
 // AddLeaf inserts a new leaf into kt_leaves and returns the generated leaf_id.
 func (s *KTStore) AddLeaf(ctx context.Context, userID, tenantID uuid.UUID, epoch int64, pubkeyHash []byte) (int64, error) {
 	var leafID int64

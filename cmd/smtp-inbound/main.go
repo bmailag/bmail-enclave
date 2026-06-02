@@ -271,6 +271,11 @@ func run() error {
 	// attachments automatically update the recipient's calendar events.
 	pipeline.SetCalendarStore(storage.NewCalendarStore(db))
 
+	// E2E private group delivery (ADR-012): the pipeline encrypts to the group
+	// key + fans to members; the receiver accepts group addresses at RCPT.
+	groupStore := storage.NewGroupStore(db)
+	pipeline.SetGroupStore(groupStore)
+
 	// Optional Redis for publishing calendar_event_updated SSE events
 	// when an inbound ICS REPLY changes an attendee's status — lets
 	// every attendee's calendar refresh in real time. Best-effort:
@@ -297,6 +302,7 @@ func run() error {
 		smtp.WithDriveStore(driveStore),
 		smtp.WithAdminStore(adminStore),
 		smtp.WithDefaultDomainStore(defaultDomainStore),
+		smtp.WithGroupStore(groupStore),
 	)
 
 	addr := os.Getenv("SMTP_ADDR")

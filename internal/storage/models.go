@@ -130,6 +130,46 @@ type TenantRole struct {
 	CreatedAt time.Time `db:"created_at"`
 }
 
+// Alias represents a row in the aliases table (ADR-010): an extra address
+// that delivers into TargetUserID's mailbox.
+type Alias struct {
+	AliasID      uuid.UUID `db:"alias_id"`
+	TenantID     uuid.UUID `db:"tenant_id"`
+	Address      string    `db:"address"`
+	TargetUserID uuid.UUID `db:"target_user_id"`
+	CreatedAt    time.Time `db:"created_at"`
+}
+
+// Group represents a row in the groups table (ADR-012): a domain-scoped
+// distribution list with a single shared hybrid keypair. The server stores only
+// the public key; the private key exists solely as per-member wrapped blobs.
+type Group struct {
+	GroupID             uuid.UUID  `db:"group_id"`
+	TenantID            uuid.UUID  `db:"tenant_id"`
+	Address             string     `db:"address"`
+	PublicKeyX25519     []byte     `db:"public_key_x25519"`
+	PublicKeyKEM        []byte     `db:"public_key_kem"` // ML-KEM-768; nil = X25519-only
+	KTEpoch             int64      `db:"kt_epoch"`       // KT tree epoch of the current pubkey leaf
+	KeyEpoch            int        `db:"key_epoch"`      // rotation counter
+	PendingKeygenUserID *uuid.UUID `db:"pending_keygen_user_id"`
+	Status              string     `db:"status"`         // active | rotation_pending
+	PostingPolicy       string     `db:"posting_policy"` // members | anyone (who may post to the group)
+	CreatedAt           time.Time  `db:"created_at"`
+}
+
+// GroupMember represents a row in the group_members table. WrappedPrivateKey +
+// KEMOutput are the group private key encapsulated to this member's KT-published
+// key (both nil until a group admin distributes the current epoch's key).
+type GroupMember struct {
+	GroupID           uuid.UUID `db:"group_id"`
+	MemberUserID      uuid.UUID `db:"member_user_id"`
+	WrappedPrivateKey []byte    `db:"wrapped_private_key"`
+	KEMOutput         []byte    `db:"kem_output"`
+	IsAdmin           bool      `db:"is_admin"`
+	JoinedAtEpoch     int       `db:"joined_at_epoch"`
+	AddedAt           time.Time `db:"added_at"`
+}
+
 // TierLimits represents a row in the tier_limits table.
 type TierLimits struct {
 	Tier             string `db:"tier"`
@@ -216,6 +256,10 @@ type Message struct {
 	RawBlobRef          *string    `db:"raw_blob_ref"`          // encrypted original RFC 5322 message (inbound only)
 	RawBlobFormat       string     `db:"raw_blob_format"`       // encryption format: "XChaCha20-Poly1305" or "XChaCha20-Poly1305-Chunked(65536)"
 	EncryptedRawMeta    []byte     `db:"encrypted_raw_meta"`    // encrypted MIME structure metadata (headers + byte offsets)
+	// GroupID is set when this message was encrypted to a private group's shared
+	// key (ADR-012) rather than the recipient user's key. NULL = normal user
+	// message. When set, KeyEpoch carries the group's key_epoch.
+	GroupID             *uuid.UUID `db:"group_id"`
 }
 
 // Label represents a row in the labels table.

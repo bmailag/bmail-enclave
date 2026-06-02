@@ -15,6 +15,7 @@ import (
 	"time"
 
 	gosmtp "github.com/emersion/go-smtp"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/bmailag/bmail/internal/gateway"
@@ -39,6 +40,7 @@ type SMTPReceiver struct {
 	driveStore         *storage.DriveStore         // optional — feeds drive usage into the over-cap check
 	adminStore         *storage.AdminStore         // optional — enables role-message capture for postmaster/abuse/...
 	defaultDomainStore *storage.DefaultDomainStore // optional — required alongside adminStore to scope reservation to bmail-managed domains
+	groupStore         *storage.GroupStore         // optional — enables E2E private group delivery (ADR-012)
 	pipeline           *Pipeline
 	server             *gosmtp.Server
 	tlsConfig          *tls.Config
@@ -101,6 +103,17 @@ func WithAdminStore(admin *storage.AdminStore) ReceiverOption {
 func WithDefaultDomainStore(d *storage.DefaultDomainStore) ReceiverOption {
 	return func(r *SMTPReceiver) {
 		r.defaultDomainStore = d
+	}
+}
+
+// WithGroupStore enables E2E private group delivery (ADR-012). When set, RCPT
+// TO for a registered group address is accepted and the message is encrypted
+// once to the group key and fanned to members. Without it, group addresses
+// resolve to nothing (rejected like any unknown recipient) — existing user /
+// alias / catch-all delivery is unaffected either way.
+func WithGroupStore(gs *storage.GroupStore) ReceiverOption {
+	return func(r *SMTPReceiver) {
+		r.groupStore = gs
 	}
 }
 
@@ -180,6 +193,7 @@ type session struct {
 	from           string
 	recipients     []string // user-mail recipients, routed through the encrypted pipeline
 	roleRecipients []string // reserved-address recipients on default domains, routed to role_messages
+	groupRecipients []string // E2E private group addresses (ADR-012), encrypted once to the group key
 	clientIP       net.IP
 	helo           string
 }
@@ -270,13 +284,35 @@ func (s *session) Rcpt(to string, opts *gosmtp.RcptOptions) error {
 		}
 	}
 
-	// Look up the recipient in the auth store.
-	// Timing is padded to prevent user enumeration via RCPT TO probing.
-	user, err := s.receiver.authStore.GetUserByAddress(ctx, to)
-
-	padSMTPTiming(rcptStart)
+	// Resolve the recipient: exact mailbox, then alias, then domain catch-all
+	// (ADR-010). Timing is padded to prevent user enumeration via RCPT TO probing.
+	user, err := s.receiver.authStore.ResolveRecipient(ctx, to)
 
 	if err != nil {
+		// Not a user / alias / catch-all. Before bouncing, check whether it's a
+		// registered E2E private group (ADR-012). This is a pure fallback — the
+		// user path above is untouched; only an otherwise-unknown address reaches
+		// here. A group lookup that errors falls through to the normal 550.
+		if s.receiver.groupStore != nil {
+			if g, gErr := s.receiver.groupStore.GetGroupByAddress(ctx, strings.ToLower(to)); gErr == nil && g != nil {
+				// Posting policy (migration 117): a members-only group rejects mail
+				// from anyone who isn't a member. 'anyone' groups stay open. The
+				// sender is a member iff MAIL FROM resolves to a user row that's in
+				// the group — external senders never match, which is the point.
+				if g.PostingPolicy == "members" && !s.senderIsGroupMember(ctx, g.GroupID) {
+					padSMTPTiming(rcptStart)
+					return &gosmtp.SMTPError{
+						Code:         550,
+						EnhancedCode: gosmtp.EnhancedCode{5, 7, 1},
+						Message:      "only members may post to this group",
+					}
+				}
+				padSMTPTiming(rcptStart)
+				s.groupRecipients = append(s.groupRecipients, strings.ToLower(to))
+				return nil
+			}
+		}
+		padSMTPTiming(rcptStart)
 		// 550 5.1.1 mirrors Gmail / Outlook for unknown recipient. Hard
 		// bounce — sender's MTA emits the DSN immediately. The padded
 		// timing above (rcptLookupTimeout / padSMTPTiming) prevents
@@ -287,6 +323,8 @@ func (s *session) Rcpt(to string, opts *gosmtp.RcptOptions) error {
 			Message:      "the email account that you tried to reach does not exist",
 		}
 	}
+
+	padSMTPTiming(rcptStart)
 
 	// Whitelist of statuses that are still receiving mail. lapsed_to_free
 	// (lapsed paid → free), prune_warned, and pruning are still
@@ -377,6 +415,22 @@ func padSMTPTiming(start time.Time) {
 	}
 }
 
+// senderIsGroupMember reports whether the envelope sender (MAIL FROM) resolves
+// to a bmail user that belongs to the group. Used to enforce a members-only
+// posting policy. Any lookup miss (external sender, unknown address) is a
+// non-member — fail closed.
+func (s *session) senderIsGroupMember(ctx context.Context, groupID uuid.UUID) bool {
+	if s.from == "" || s.receiver.authStore == nil || s.receiver.groupStore == nil {
+		return false
+	}
+	u, err := s.receiver.authStore.GetUserByAddress(ctx, s.from)
+	if err != nil || u == nil {
+		return false
+	}
+	m, err := s.receiver.groupStore.GetMember(ctx, groupID, u.UserID)
+	return err == nil && m != nil
+}
+
 // Data implements gosmtp.Session — handles the DATA command.
 func (s *session) Data(r io.Reader) error {
 	// Limit message size to prevent memory exhaustion from slow-read attacks.
@@ -392,7 +446,7 @@ func (s *session) Data(r io.Reader) error {
 		}
 	}
 
-	if len(s.recipients) == 0 && len(s.roleRecipients) == 0 {
+	if len(s.recipients) == 0 && len(s.roleRecipients) == 0 && len(s.groupRecipients) == 0 {
 		return &gosmtp.SMTPError{
 			Code:    503,
 			Message: "no recipients specified",
@@ -433,18 +487,55 @@ func (s *session) Data(r io.Reader) error {
 	}
 
 	var succeeded, failed int
+	// Expand each accepted recipient to its delivery targets: a group address
+	// (ADR-010/011) fans out to all member mailboxes; an alias/exact resolves to
+	// one. Each target is delivered + encrypted individually. Dedup so a member
+	// addressed both directly and via a group gets a single copy.
+	delivered := make(map[string]bool)
 	for _, rcpt := range s.recipients {
-		if err := s.receiver.pipeline.ProcessMessage(ctx, s.from, rcpt, rawMessage, clientIP, s.helo); err != nil {
-			slog.Error("pipeline error", "from", gateway.RedactEmail(s.from), "to", gateway.RedactEmail(rcpt), "error", err)
-			failed++
-		} else {
-			succeeded++
+		targets, rerr := s.receiver.authStore.ResolveRecipientAddresses(ctx, rcpt)
+		if rerr != nil || len(targets) == 0 {
+			targets = []string{rcpt} // shouldn't happen (RCPT was accepted); be safe
+		}
+		for _, target := range targets {
+			if delivered[target] {
+				continue
+			}
+			delivered[target] = true
+			if err := s.receiver.pipeline.ProcessMessage(ctx, s.from, target, rawMessage, clientIP, s.helo); err != nil {
+				slog.Error("pipeline error", "from", gateway.RedactEmail(s.from), "to", gateway.RedactEmail(target), "error", err)
+				failed++
+			} else {
+				succeeded++
+			}
 		}
 	}
 
-	// At least one recipient (mail or role) must have succeeded for a
+	// E2E private group delivery (ADR-012): encrypt once to the group key and
+	// fan the ciphertext to members. Separate from the user/alias path above, so
+	// normal mail is unaffected. A group address never overlaps a user mailbox.
+	var groupSucceeded int
+	for _, rcpt := range s.groupRecipients {
+		g, gErr := s.receiver.groupStore.GetGroupByAddress(ctx, rcpt)
+		if gErr != nil || g == nil {
+			slog.Error("group resolve at delivery", "to", rcpt, "error", gErr)
+			failed++
+			continue
+		}
+		// Pass the direct To/Cc recipients of this same delivery so members who
+		// already got a personal copy (or the sender themselves) aren't fanned a
+		// duplicate (Gmail-style ingestion dedup).
+		if err := s.receiver.pipeline.ProcessGroupMessage(ctx, s.from, g, rawMessage, clientIP, s.helo, s.recipients...); err != nil {
+			slog.Error("group pipeline error", "from", gateway.RedactEmail(s.from), "group", rcpt, "error", err)
+			failed++
+		} else {
+			groupSucceeded++
+		}
+	}
+
+	// At least one recipient (mail, role, or group) must have succeeded for a
 	// 250 OK response. Otherwise the sender's MTA retries.
-	if succeeded == 0 && roleSucceeded == 0 {
+	if succeeded == 0 && roleSucceeded == 0 && groupSucceeded == 0 {
 		return &gosmtp.SMTPError{
 			Code:    451,
 			Message: "temporary processing error",
@@ -459,6 +550,7 @@ func (s *session) Reset() {
 	s.from = ""
 	s.recipients = nil
 	s.roleRecipients = nil
+	s.groupRecipients = nil
 }
 
 // Logout implements gosmtp.Session — handles QUIT.

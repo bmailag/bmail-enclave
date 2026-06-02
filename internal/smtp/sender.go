@@ -214,19 +214,16 @@ func (s *SMTPSender) SendMessage(ctx context.Context, from, to string, body []by
 	}
 
 	// Ed25519 signature — added as secondary for forward compatibility.
-	if usePool {
-		if len(pool.Ed25519Seed) != ed25519.SeedSize {
-			return fmt.Errorf("pool ed25519 seed wrong size: %d", len(pool.Ed25519Seed))
-		}
-		privKey := ed25519.NewKeyFromSeed(pool.Ed25519Seed)
-		signed, signErr := domain.SignMessage(privKey, tenant.Domain, pool.Selector, body)
-		if signErr != nil {
-			return fmt.Errorf("dkim ed25519 sign (pool): %w", signErr)
-		}
-		body = signed
-		dkimSigned = true
-		slog.Info("dkim_signed", "type", "ed25519", "source", "pool", "selector", pool.Selector)
-	} else if len(tenant.DKIMPrivateKeyEncrypted) > 0 && tenant.DKIMSelector != "" {
+	//
+	// POOL PATH INTENTIONALLY SKIPS ED25519: the pool publishes ONE selector,
+	// and putting two key types under one selector makes DKIM verification
+	// undefined (RFC 6376 §3.6.2.2 — the verifier picks an arbitrary TXT
+	// record, so the RSA signature randomly fails against the ed25519 key).
+	// That was junking custom-domain mail at our own inbound filter and would
+	// do the same at Gmail. Receivers that matter don't verify ed25519-DKIM
+	// anyway; the per-tenant path below keeps it because it uses separate
+	// selectors per algorithm.
+	if !usePool && len(tenant.DKIMPrivateKeyEncrypted) > 0 && tenant.DKIMSelector != "" {
 		var seed []byte
 		if s.teeRuntime != nil {
 			unsealed, unsealErr := s.teeRuntime.Unseal(tenant.DKIMPrivateKeyEncrypted)
