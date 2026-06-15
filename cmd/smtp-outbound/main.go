@@ -59,9 +59,9 @@ type OutboundMessage struct {
 	SenderDisplayName    string                `json:"sender_display_name,omitempty"`
 	AttachmentIDs        []string              `json:"attachment_ids,omitempty"`
 	SenderUserID         string                `json:"sender_user_id,omitempty"`
-	SenderTier           string                `json:"sender_tier,omitempty"` // free / mail / unlimited / business / enterprise
+	SenderTier           string                `json:"sender_tier,omitempty"`           // free / mail / unlimited / business / enterprise
 	SenderAffiliateCode  string                `json:"sender_affiliate_code,omitempty"` // KLB affiliate code; appended as ?_a=<code> on the free-tier footer URL
-	PlaintextAttachments []plaintextAttachment  `json:"plaintext_attachments,omitempty"`
+	PlaintextAttachments []plaintextAttachment `json:"plaintext_attachments,omitempty"`
 	CcAddresses          []string              `json:"cc_addresses,omitempty"`
 	InReplyTo            string                `json:"in_reply_to,omitempty"`
 	BodyFormat           string                `json:"body_format,omitempty"` // "html" (default) or "plain"
@@ -126,6 +126,7 @@ func base64Decode(s string) (string, error) {
 //   - PGP-encrypted armored text (encryption_type == "pgp")
 //   - Plaintext (encryption_type == "plaintext" or when sending to external non-PGP)
 //   - Bmail-encrypted ciphertext (shouldn't reach external delivery, but handle gracefully)
+//
 // stripHTMLTags removes HTML tags from a string for plain-text conversion.
 func stripHTMLTags(s string) string {
 	var out strings.Builder
@@ -272,6 +273,143 @@ func extractICSMethod(body string) string {
 		}
 	}
 	return ""
+}
+
+var icsFoldRe = regexp.MustCompile(`\n[ \t]`)
+
+// icsUnfoldLines normalizes line endings and unfolds RFC-5545 continuation lines.
+func icsUnfoldLines(body string) []string {
+	n := strings.ReplaceAll(strings.ReplaceAll(body, "\r\n", "\n"), "\r", "\n")
+	n = icsFoldRe.ReplaceAllString(n, "")
+	var out []string
+	for _, l := range strings.Split(n, "\n") {
+		if strings.TrimSpace(l) != "" {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// icsProp returns the params + value for the first occurrence of an ICS property.
+func icsProp(lines []string, name string) (params, value string) {
+	upper := strings.ToUpper(name)
+	for _, l := range lines {
+		idx := strings.IndexByte(l, ':')
+		if idx < 0 {
+			continue
+		}
+		key := l[:idx]
+		kn := key
+		if sc := strings.IndexByte(key, ';'); sc >= 0 {
+			kn = key[:sc]
+		}
+		if strings.ToUpper(strings.TrimSpace(kn)) == upper {
+			p := ""
+			if sc := strings.IndexByte(key, ';'); sc >= 0 {
+				p = key[sc+1:]
+			}
+			return p, l[idx+1:]
+		}
+	}
+	return "", ""
+}
+
+func icsUnescapeText(s string) string {
+	s = strings.ReplaceAll(s, `\n`, "\n")
+	s = strings.ReplaceAll(s, `\N`, "\n")
+	s = strings.ReplaceAll(s, `\,`, ",")
+	s = strings.ReplaceAll(s, `\;`, ";")
+	s = strings.ReplaceAll(s, `\\`, `\`)
+	return strings.TrimSpace(s)
+}
+
+func icsHumanWhen(lines []string) string {
+	params, val := icsProp(lines, "DTSTART")
+	val = strings.TrimSpace(val)
+	if val == "" {
+		return ""
+	}
+	if strings.Contains(strings.ToUpper(params), "VALUE=DATE") || len(val) == 8 {
+		if t, err := time.Parse("20060102", val); err == nil {
+			return t.Format("Mon, Jan 2, 2006") + " (all day)"
+		}
+	}
+	suffix := ""
+	v := val
+	if strings.HasSuffix(v, "Z") {
+		v = strings.TrimSuffix(v, "Z")
+		suffix = " UTC"
+	}
+	if t, err := time.Parse("20060102T150405", v); err == nil {
+		return t.Format("Mon, Jan 2, 2006 3:04 PM") + suffix
+	}
+	return val
+}
+
+// icsFriendlyBody derives a human-readable plain + HTML summary from an ICS so a
+// calendar invite carries a readable fallback alongside the text/calendar part
+// (some clients only show the alternative body; Gmail shows it + the RSVP card).
+func icsFriendlyBody(body string) (plain, htmlBody string) {
+	lines := icsUnfoldLines(body)
+	_, summary := icsProp(lines, "SUMMARY")
+	summary = icsUnescapeText(summary)
+	_, loc := icsProp(lines, "LOCATION")
+	loc = icsUnescapeText(loc)
+	_, desc := icsProp(lines, "DESCRIPTION")
+	desc = icsUnescapeText(desc)
+	_, org := icsProp(lines, "ORGANIZER")
+	orgEmail := ""
+	if i := strings.LastIndex(strings.ToLower(org), "mailto:"); i >= 0 {
+		orgEmail = strings.TrimSpace(org[i+len("mailto:"):])
+	}
+	when := icsHumanWhen(lines)
+	verb := "You've been invited to"
+	switch strings.ToUpper(extractICSMethod(body)) {
+	case "CANCEL":
+		verb = "This event was cancelled"
+	case "REPLY":
+		verb = "RSVP update for"
+	}
+	if summary == "" {
+		summary = "(untitled event)"
+	}
+
+	esc := html.EscapeString
+	var hb strings.Builder
+	fmt.Fprintf(&hb, "<p>%s:</p><p><strong>%s</strong>", esc(verb), esc(summary))
+	if when != "" {
+		fmt.Fprintf(&hb, "<br>%s", esc(when))
+	}
+	hb.WriteString("</p>")
+	if loc != "" {
+		if strings.HasPrefix(loc, "http://") || strings.HasPrefix(loc, "https://") {
+			fmt.Fprintf(&hb, `<p>📍 <a href="%s">%s</a></p>`, esc(loc), esc(loc))
+		} else {
+			fmt.Fprintf(&hb, "<p>📍 %s</p>", esc(loc))
+		}
+	}
+	if desc != "" {
+		fmt.Fprintf(&hb, "<p>%s</p>", strings.ReplaceAll(esc(desc), "\n", "<br>"))
+	}
+	if orgEmail != "" {
+		fmt.Fprintf(&hb, `<p style="color:#888;font-size:13px">Organizer: %s</p>`, esc(orgEmail))
+	}
+
+	var pb strings.Builder
+	fmt.Fprintf(&pb, "%s:\n%s\n", verb, summary)
+	if when != "" {
+		fmt.Fprintf(&pb, "%s\n", when)
+	}
+	if loc != "" {
+		fmt.Fprintf(&pb, "%s\n", loc)
+	}
+	if desc != "" {
+		fmt.Fprintf(&pb, "\n%s\n", desc)
+	}
+	if orgEmail != "" {
+		fmt.Fprintf(&pb, "\nOrganizer: %s\n", orgEmail)
+	}
+	return pb.String(), hb.String()
 }
 
 func composeRFC5322(om *OutboundMessage, attachments []mimeAttachment) []byte {
@@ -471,9 +609,23 @@ func composeRFC5322(om *OutboundMessage, attachments []mimeAttachment) []byte {
 		if method == "" {
 			method = "REQUEST"
 		}
-		fmt.Fprintf(&b, "Content-Type: text/calendar; charset=utf-8; method=%s\r\n", method)
-		fmt.Fprintf(&b, "\r\n")
+		// multipart/alternative { text/plain, text/html, text/calendar }: a readable
+		// fallback for any client + the text/calendar part (most-preferred = last) so
+		// Gmail/Outlook/Apple render the RSVP card. text/calendar alone left strict
+		// clients showing the raw ICS.
+		plain, htmlBody := icsFriendlyBody(body)
+		cb := fmt.Sprintf("=_bmail_cal_%d", time.Now().UnixNano())
+		fmt.Fprintf(&b, "Content-Type: multipart/alternative; boundary=\"%s\"\r\n\r\n", cb)
+		fmt.Fprintf(&b, "--%s\r\n", cb)
+		fmt.Fprintf(&b, "Content-Type: text/plain; charset=utf-8\r\n\r\n")
+		fmt.Fprintf(&b, "%s\r\n", strings.TrimSpace(plain))
+		fmt.Fprintf(&b, "--%s\r\n", cb)
+		fmt.Fprintf(&b, "Content-Type: text/html; charset=utf-8\r\n\r\n")
+		fmt.Fprintf(&b, "<!DOCTYPE html><html><body>%s</body></html>\r\n", htmlBody)
+		fmt.Fprintf(&b, "--%s\r\n", cb)
+		fmt.Fprintf(&b, "Content-Type: text/calendar; charset=utf-8; method=%s\r\n\r\n", method)
 		fmt.Fprintf(&b, "%s\r\n", body)
+		fmt.Fprintf(&b, "--%s--\r\n", cb)
 		goto sendMsg
 	}
 

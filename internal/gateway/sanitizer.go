@@ -24,6 +24,7 @@ var allowedHeaders = map[string]bool{
 	"X-Client-Type":     true, // mobile client identification
 	"X-Account-Index":   true, // multi-account cookie selection
 	"X-Platform-Secret": true, // platform admin authentication (localhost only)
+	"X-Meet-Secret":     true, // meet service participant-cap lookup (server-to-server)
 }
 
 // SessionCookieName is the name of the session cookie used by the gateway.

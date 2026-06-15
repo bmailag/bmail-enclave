@@ -206,6 +206,19 @@ func run() error {
 			if v := req.Header.Get("Stripe-Signature"); v != "" {
 				sanitized.Set("Stripe-Signature", v)
 			}
+			// Origin — needed so the backend's CORS middleware can echo an
+			// allow-list match (e.g. the meet site detecting a bmail session
+			// for the guest→verified-tab forward). Not client-identifying:
+			// it's the calling site, only present on cross-origin requests.
+			if v := req.Header.Get("Origin"); v != "" {
+				sanitized.Set("Origin", v)
+			}
+			// Shared secret for the meet service's trusted server-to-server
+			// participant-cap lookup (/auth/meet-cap). Server-originated,
+			// never set by browsers.
+			if v := req.Header.Get("X-Meet-Secret"); v != "" {
+				sanitized.Set("X-Meet-Secret", v)
+			}
 			// Forwarded host for multi-domain support.
 			sanitized.Set("X-Forwarded-Host", req.Host)
 
@@ -281,6 +294,13 @@ func run() error {
 		"/auth/accounts":              true,
 		"/auth/push-config":           true,
 		"/auth/keys":                  true,
+		"/auth/meet-cap":              true,
+		// KT read endpoints — unauthenticated proofs for trustless identity
+		// verification (meet badge, recipient-key audit). /kt/advance is
+		// admin-gated and deliberately NOT listed.
+		"/kt/signing-key":             true,
+		"/kt/key":                     true,
+		"/kt/root":                    true,
 		"/auth/recipient-keys":        true,
 		"/auth/pgp-key":               true,
 		"/auth/entitlement-pubkey":    true,

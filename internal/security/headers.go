@@ -34,7 +34,11 @@ func SecurityHeaders(next http.Handler) http.Handler {
 		// network calls happen inside the frame and don't inherit our CSP).
 		h.Set("Content-Security-Policy",
 			"default-src 'self'; "+
-				"script-src 'self' 'wasm-unsafe-eval' https://challenges.cloudflare.com; "+
+				// blob: — the DeepFilterNet3 noise-suppression worklet (in the
+				// embedded Meet tab) registers via an AudioWorklet.addModule()
+				// on a same-origin blob: URL. blob: URLs are page-created and
+				// same-origin, so this is a mild relaxation (no third party).
+				"script-src 'self' 'wasm-unsafe-eval' blob: https://challenges.cloudflare.com; "+
 				"style-src 'self'; "+
 				"img-src 'self' data:; "+
 				// F-36: api.github.com previously allowed here so /verify
@@ -43,7 +47,17 @@ func SecurityHeaders(next http.Handler) http.Handler {
 				// /verify/latest-enclave-release endpoints, so connect-src
 				// is back to just 'self'. Closes the "any XSS can exfil
 				// to a Gist via the GitHub allowance" amplifier.
-				"connect-src 'self'; "+
+				// meet.{fullxp.net,bmail.ag} + wss: the embedded Meet tab
+				// (<MeetRoom>) runs on bmail's origin and talks to the meet
+				// service (/v1/* + wss signaling). Its runtime assets load
+				// same-origin from /meet-assets, so only connect-src needs
+				// the meet origin — not script-src/worker-src.
+				// *.meet.bmail.ag:7443 — the SFU fleet nodes the meet client
+				// opens a LiveKit wss to once a room switches to SFU (the
+				// per-node Caddy TLS endpoint). connect-src governs WebSockets,
+				// so without this the SFU signaling socket is blocked (mesh is
+				// unaffected — ICE/TURN isn't gated by connect-src).
+				"connect-src 'self' https://meet.fullxp.net wss://meet.fullxp.net https://meet.bmail.ag wss://meet.bmail.ag https://*.meet.bmail.ag:7443 wss://*.meet.bmail.ag:7443; "+
 				"font-src 'self'; "+
 				"frame-src 'self' https://challenges.cloudflare.com; "+
 				"object-src 'none'; "+
@@ -65,7 +79,7 @@ func SecurityHeaders(next http.Handler) http.Handler {
 
 		// Disable unnecessary browser features.
 		h.Set("Permissions-Policy",
-			"camera=(), microphone=(), geolocation=(), payment=(), usb=()")
+			"camera=(self), microphone=(self), geolocation=(), payment=(), usb=()")
 
 		// Legacy XSS protection header — set to 0 because modern CSP is better
 		// and the filter itself can introduce vulnerabilities.
