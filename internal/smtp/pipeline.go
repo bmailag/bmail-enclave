@@ -811,6 +811,19 @@ type parsedMessage struct {
 	CalendarICS []byte // raw text/calendar content (if present)
 }
 
+// addressDisplayHeaders are the header fields whose value carries a
+// human-readable display name that may be RFC 2047 encoded. Their
+// values are run through mailparse.DecodeHeader at ingestion. Keys use
+// go-message's canonical MIME-header casing.
+var addressDisplayHeaders = map[string]bool{
+	"From":     true,
+	"To":       true,
+	"Cc":       true,
+	"Bcc":      true,
+	"Reply-To": true,
+	"Sender":   true,
+}
+
 // parseMessageFull extracts subject, body, attachments, and threading headers.
 func parseMessageFull(rawMessage []byte) (*parsedMessage, error) {
 	subject, body, attachments, calendarICS, err := parseMessage(rawMessage)
@@ -835,6 +848,15 @@ func parseMessageFull(rawMessage []byte) (*parsedMessage, error) {
 		for fields.Next() {
 			key := fields.Key()
 			val := fields.Value()
+			// go-message returns header field values verbatim, so RFC 2047
+			// encoded-words ("=?UTF-8?Q?Mark_Karpel=C3=A8s?=") in the
+			// display-name portion of address headers survive un-decoded
+			// all the way to the client UI. Decode them here, at ingestion,
+			// for the headers that legitimately carry display names. Decode
+			// is a safe no-op for plain-ASCII values.
+			if addressDisplayHeaders[key] {
+				val = mailparse.DecodeHeader(val)
+			}
 			result.Headers[key] = append(result.Headers[key], val)
 		}
 	}
