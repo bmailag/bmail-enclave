@@ -61,10 +61,10 @@ func (s *BillingStore) ListTierLimits(ctx context.Context) ([]TierLimits, error)
 // AddCredit inserts a new billing credit for a tenant.
 func (s *BillingStore) AddCredit(ctx context.Context, credit *BillingCredit) error {
 	_, err := s.DB.Pool.Exec(ctx,
-		`INSERT INTO billing_credits (credit_id, tenant_id, tier, mailbox_quota, valid_from, valid_until, token_hash, price_cents_each)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		`INSERT INTO billing_credits (credit_id, tenant_id, tier, mailbox_quota, valid_from, valid_until, token_hash, price_cents_each, user_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		credit.CreditID, credit.TenantID, credit.Tier, credit.MailboxQuota,
-		credit.ValidFrom, credit.ValidUntil, credit.TokenHash, credit.PriceCentsEach,
+		credit.ValidFrom, credit.ValidUntil, credit.TokenHash, credit.PriceCentsEach, credit.UserID,
 	)
 	if err != nil {
 		return fmt.Errorf("add billing credit: %w", err)
@@ -181,7 +181,7 @@ func (s *BillingStore) SumTenantStorageBlocks(ctx context.Context, tenantID uuid
 // GetActiveCredits returns all active billing credits for a tenant.
 func (s *BillingStore) GetActiveCredits(ctx context.Context, tenantID uuid.UUID) ([]BillingCredit, error) {
 	rows, err := s.DB.Pool.Query(ctx,
-		`SELECT credit_id, tenant_id, tier, mailbox_quota, valid_from, valid_until, token_hash, price_cents_each, created_at
+		`SELECT credit_id, tenant_id, tier, mailbox_quota, valid_from, valid_until, token_hash, price_cents_each, created_at, user_id
 		 FROM billing_credits
 		 WHERE tenant_id = $1 AND valid_from <= now() AND valid_until > now()
 		 ORDER BY valid_until`, tenantID,
@@ -195,7 +195,7 @@ func (s *BillingStore) GetActiveCredits(ctx context.Context, tenantID uuid.UUID)
 	for rows.Next() {
 		var c BillingCredit
 		if err := rows.Scan(&c.CreditID, &c.TenantID, &c.Tier, &c.MailboxQuota,
-			&c.ValidFrom, &c.ValidUntil, &c.TokenHash, &c.PriceCentsEach, &c.CreatedAt); err != nil {
+			&c.ValidFrom, &c.ValidUntil, &c.TokenHash, &c.PriceCentsEach, &c.CreatedAt, &c.UserID); err != nil {
 			return nil, fmt.Errorf("scan credit: %w", err)
 		}
 		credits = append(credits, c)

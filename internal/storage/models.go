@@ -190,6 +190,11 @@ type BillingCredit struct {
 	TokenHash      []byte    `db:"token_hash"`
 	PriceCentsEach int       `db:"price_cents_each"`
 	CreatedAt      time.Time `db:"created_at"`
+	// UserID attributes the credit to the user who redeemed it (voucher path).
+	// NULL for tenant-pooled credits (Stripe invoice credits, comps, all
+	// historical rows) — see migration 118. Used by /billing/me to show a user
+	// their OWN plan on a shared first-party tenant instead of credits[0].
+	UserID *uuid.UUID `db:"user_id"`
 }
 
 // PricingBracket defines per-mailbox pricing for a volume range.

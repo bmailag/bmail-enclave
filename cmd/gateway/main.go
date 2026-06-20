@@ -190,6 +190,15 @@ func run() error {
 			if v := req.Header.Get("X-Account-Index"); v != "" {
 				sanitized.Set("X-Account-Index", v)
 			}
+			// One-time step-up token for destructive actions (F-18: account
+			// deletion). Server-issued nonce echoed back by the browser on the
+			// next request — NOT client-identifying. Without forwarding it the
+			// backend always reads an empty X-Reauth-Token and returns
+			// "re-authentication required", so account deletion is impossible
+			// through the gateway even after a successful reauth round.
+			if v := req.Header.Get("X-Reauth-Token"); v != "" {
+				sanitized.Set("X-Reauth-Token", v)
+			}
 			if v := req.Header.Get("Last-Event-Id"); v != "" {
 				sanitized.Set("Last-Event-Id", v)
 			}
