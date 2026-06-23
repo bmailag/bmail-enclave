@@ -661,6 +661,24 @@ sendMsg:
 
 const maxAttempts = 3
 
+// tmpBlobsTerminal reports whether an outbound send outcome is TERMINAL — i.e. the
+// message will not be retried — and so the temporary plaintext-attachment blobs may
+// be reclaimed. Terminal states: delivered (sendErr == nil), permanently bounced, or
+// out of retries. `attempt` is om.Attempt for the attempt that just ran (0-based), so
+// the out-of-retries check mirrors the retry path's `om.Attempt++; om.Attempt >= maxAttempts`.
+// A retryable temporary failure returns false: the blobs must survive so the retry can
+// re-fetch them, otherwise the attachment is silently dropped on resend.
+func tmpBlobsTerminal(sendErr error, attempt int) bool {
+	if sendErr == nil {
+		return true
+	}
+	var permErr *smtp.ErrPermanent
+	if errors.As(sendErr, &permErr) {
+		return true
+	}
+	return attempt+1 >= maxAttempts
+}
+
 // outboundHandler processes messages from the mail.outbound.> queue.
 type outboundHandler struct {
 	ctx              context.Context
@@ -692,17 +710,23 @@ func (h *outboundHandler) handle(msg []byte) error {
 	// Use plaintext attachments from payload if available (E2E encrypted flow —
 	// client decrypted and provided plaintext for external delivery).
 	var attachments []mimeAttachment
+	// Temporary MinIO blobs holding plaintext attachment bytes. These are deleted
+	// ONLY after a terminal outcome (delivered / permanent bounce / out of retries),
+	// never right after download. Deleting before send means a temporary SMTP
+	// failure (e.g. Gmail greylisting, which is routine) re-queues the message, and
+	// the retry re-fetches a now-deleted blob — silently dropping the attachment
+	// while the email itself still goes out. See tmpBlobsTerminal below.
+	var tmpBlobKeys []string
 	if len(om.PlaintextAttachments) > 0 {
 		for _, pa := range om.PlaintextAttachments {
 			// Data field is a MinIO blob reference (stored by gateway to avoid NATS size limits).
 			var data []byte
 			var fetchErr error
 			if h.blobStore != nil && strings.Contains(pa.Data, "/att/") {
-				// Blob reference — download from MinIO.
+				// Blob reference — download from MinIO. Defer cleanup to after send.
 				data, fetchErr = h.blobStore.DownloadShared(h.ctx, pa.Data)
 				if fetchErr == nil {
-					// Clean up temporary blob after fetching.
-					_ = h.blobStore.Delete(h.ctx, pa.Data)
+					tmpBlobKeys = append(tmpBlobKeys, pa.Data)
 				}
 			} else {
 				// Legacy: inline base64 data.
@@ -766,7 +790,20 @@ func (h *outboundHandler) handle(msg []byte) error {
 
 	slog.Info("composed RFC 5322 message", "total_bytes", len(rfcBody))
 
+	deleteTmpBlobs := func() {
+		for _, k := range tmpBlobKeys {
+			if h.blobStore != nil {
+				_ = h.blobStore.Delete(h.ctx, k)
+			}
+		}
+	}
+
 	sendErr := h.sender.SendMessage(h.ctx, om.SenderAddress, om.ToAddress, rfcBody, tenantID)
+	// Reclaim the temporary attachment blobs only on a terminal outcome. A
+	// will-retry temporary failure keeps them so the retry can re-fetch.
+	if tmpBlobsTerminal(sendErr, om.Attempt) {
+		deleteTmpBlobs()
+	}
 	if sendErr == nil {
 		slog.Info("delivered message", "from", gateway.RedactEmail(om.SenderAddress), "to", gateway.RedactEmail(om.ToAddress))
 		return nil
