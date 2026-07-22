@@ -1004,10 +1004,15 @@ func (s *AuthStore) DeleteAllSessions(ctx context.Context, userID uuid.UUID) err
 	return nil
 }
 
-// PurgeExpiredSessions deletes all sessions whose expires_at is in the past.
+// PurgeExpiredSessions deletes sessions whose REFRESH window has fully expired.
+// Must key on refresh_expires_at (90d), NOT expires_at (24h bearer): a row whose
+// bearer token has expired is still refreshable for up to 90 days, and deleting
+// it on the 24h mark destroys the refresh token, force-logging-out any client
+// idle >24h. Bearer-expired-but-refreshable rows are still rejected for normal
+// auth by the expires_at > now() filter in the session/token lookups.
 // Returns the number of rows deleted.
 func (s *AuthStore) PurgeExpiredSessions(ctx context.Context) (int64, error) {
-	tag, err := s.DB.Pool.Exec(ctx, `DELETE FROM sessions WHERE expires_at < now()`)
+	tag, err := s.DB.Pool.Exec(ctx, `DELETE FROM sessions WHERE refresh_expires_at < now()`)
 	if err != nil {
 		return 0, fmt.Errorf("purge expired sessions: %w", err)
 	}
@@ -1036,7 +1041,7 @@ func (s *AuthStore) PurgeExpiredSessionsWithLock(ctx context.Context) (int64, er
 		return 0, nil // another instance is handling cleanup
 	}
 
-	tag, err := tx.Exec(ctx, `DELETE FROM sessions WHERE expires_at < now()`)
+	tag, err := tx.Exec(ctx, `DELETE FROM sessions WHERE refresh_expires_at < now()`)
 	if err != nil {
 		return 0, fmt.Errorf("purge expired sessions: %w", err)
 	}
