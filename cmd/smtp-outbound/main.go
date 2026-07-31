@@ -887,6 +887,10 @@ func run() error {
 		} else {
 			blobStore = bs
 			slog.Info("blob store connected for outbound attachments")
+			// R2 migration fallback: attachment reads that miss the primary
+			// (new account) fall through to the old account. Dormant unless
+			// MINIO_FALLBACK_* is set (and listed in enclave/smtp-outbound.json).
+			storage.AttachMigrationFallback(blobStore)
 		}
 	} else {
 		slog.Warn("MINIO_ENDPOINT/ACCESS_KEY/SECRET_KEY not set, outbound attachments disabled")

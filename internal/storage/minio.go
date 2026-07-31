@@ -3,10 +3,12 @@ package storage
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"os"
@@ -39,8 +41,66 @@ func NewBlobStoreWithBucket(endpoint, accessKey, secretKey string, useSSL bool, 
 
 // BlobStore wraps a MinIO client for encrypted message blob storage.
 type BlobStore struct {
-	client *minio.Client
-	bucket string // per-instance bucket override; empty = use global blobBucket
+	client   *minio.Client
+	bucket   string        // per-instance bucket override; empty = use global blobBucket
+	fallback *minio.Client // optional read-only secondary source (see SetFallback)
+}
+
+// fallbackReadCount counts reads served from the migration fallback across all
+// BlobStores in the process. Steady zero means the fallback is no longer needed.
+var fallbackReadCount int64
+
+// FallbackHits returns the number of reads served from the migration fallback.
+// During an R2 account migration, watch this drop to (and stay at) zero after
+// the final delta sync — that's the signal it's safe to remove the fallback.
+func FallbackHits() int64 { return atomic.LoadInt64(&fallbackReadCount) }
+
+// SetFallback attaches a secondary, read-only blob source used only when the
+// primary returns NoSuchKey. During an R2 account migration the primary points
+// at the NEW account and the fallback at the OLD one, so a read for an object
+// not yet copied still succeeds (served from the old account) instead of 404ing.
+// Writes and deletes never touch the fallback. The fallback reads the SAME
+// bucket name as the primary — buckets are mirrored under identical names.
+// AttachMigrationFallback reads MINIO_FALLBACK_ENDPOINT / _ACCESS_KEY /
+// _SECRET_KEY from the environment and, if all three are present, attaches the
+// old account as a read-only fallback on each given store. Bucket names are
+// unchanged (mirrored identically), so only the endpoint+creds differ. Returns
+// true iff a fallback was configured. nil stores are skipped. When the env is
+// unset this is a no-op — so the fallback code stays dormant until cutover.
+func AttachMigrationFallback(stores ...*BlobStore) bool {
+	ep := os.Getenv("MINIO_FALLBACK_ENDPOINT")
+	ak := os.Getenv("MINIO_FALLBACK_ACCESS_KEY")
+	sk := os.Getenv("MINIO_FALLBACK_SECRET_KEY")
+	if ep == "" || ak == "" || sk == "" {
+		return false
+	}
+	ssl := os.Getenv("MINIO_FALLBACK_USE_SSL") != "false" // default true (R2 is TLS)
+	n := 0
+	for _, s := range stores {
+		if s == nil {
+			continue
+		}
+		if err := s.SetFallback(ep, ak, sk, ssl); err != nil {
+			slog.Warn("blob migration fallback unavailable", "error", err)
+			continue
+		}
+		n++
+	}
+	slog.Info("blob migration fallback enabled", "endpoint", ep, "stores", n)
+	return n > 0
+}
+
+func (bs *BlobStore) SetFallback(endpoint, accessKey, secretKey string, useSSL bool) error {
+	client, err := minio.New(endpoint, &minio.Options{
+		Creds:        credentials.NewStaticV4(accessKey, secretKey, ""),
+		Secure:       useSSL,
+		BucketLookup: minio.BucketLookupPath,
+	})
+	if err != nil {
+		return fmt.Errorf("create fallback minio client: %w", err)
+	}
+	bs.fallback = client
+	return nil
 }
 
 // NewBlobStore creates a new BlobStore connected to the given MinIO endpoint.
@@ -121,7 +181,28 @@ func (bs *BlobStore) Upload(ctx context.Context, tenantID, userID, messageID uui
 // This is unexported to prevent bypassing ownership checks — callers outside
 // the package should use DownloadVerified instead.
 func (bs *BlobStore) download(ctx context.Context, blobRef string) ([]byte, error) {
-	obj, err := bs.client.GetObject(ctx, bs.bucketName(), blobRef, minio.GetObjectOptions{})
+	data, err := getFrom(ctx, bs.client, bs.bucketName(), blobRef)
+	if err == nil {
+		return data, nil
+	}
+	// On a genuine miss, try the migration fallback (old account) before
+	// giving up. Any other error is returned as-is.
+	if bs.fallback != nil && errors.Is(err, ErrBlobNotFound) {
+		fbData, fbErr := getFrom(ctx, bs.fallback, bs.bucketName(), blobRef)
+		if fbErr == nil {
+			atomic.AddInt64(&fallbackReadCount, 1)
+			slog.Info("blob served from migration fallback", "bucket", bs.bucketName(), "ref", blobRef)
+			return fbData, nil
+		}
+	}
+	return nil, err
+}
+
+// getFrom performs the actual lazy S3 GET+read against a specific client,
+// mapping a NoSuchKey to ErrBlobNotFound. Shared by the primary and fallback
+// paths so both classify a missing object identically.
+func getFrom(ctx context.Context, client *minio.Client, bucket, blobRef string) ([]byte, error) {
+	obj, err := client.GetObject(ctx, bucket, blobRef, minio.GetObjectOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("get blob: %w", err)
 	}
@@ -239,7 +320,26 @@ func (bs *BlobStore) DownloadChunk(ctx context.Context, blobRef string, chunkInd
 // the returned reader when done. The returned size comes from a Stat call on
 // the object.
 func (bs *BlobStore) DownloadStream(ctx context.Context, blobRef string) (io.ReadCloser, int64, error) {
-	obj, err := bs.client.GetObject(ctx, bs.bucketName(), blobRef, minio.GetObjectOptions{})
+	rc, size, err := streamFrom(ctx, bs.client, bs.bucketName(), blobRef)
+	if err == nil {
+		return rc, size, nil
+	}
+	if bs.fallback != nil && errors.Is(err, ErrBlobNotFound) {
+		frc, fsize, fbErr := streamFrom(ctx, bs.fallback, bs.bucketName(), blobRef)
+		if fbErr == nil {
+			atomic.AddInt64(&fallbackReadCount, 1)
+			slog.Info("blob streamed from migration fallback", "bucket", bs.bucketName(), "ref", blobRef)
+			return frc, fsize, nil
+		}
+	}
+	return nil, 0, err
+}
+
+// streamFrom opens a streaming reader against a specific client, mapping a
+// NoSuchKey (surfaced by the Stat) to ErrBlobNotFound. Shared by the primary
+// and fallback paths.
+func streamFrom(ctx context.Context, client *minio.Client, bucket, blobRef string) (io.ReadCloser, int64, error) {
+	obj, err := client.GetObject(ctx, bucket, blobRef, minio.GetObjectOptions{})
 	if err != nil {
 		return nil, 0, fmt.Errorf("download stream: %w", err)
 	}
